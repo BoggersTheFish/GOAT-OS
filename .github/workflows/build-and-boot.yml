@@ -1,0 +1,41 @@
+# BTFOS/GOAT-OS: Build kernel, build ISO, run in QEMU and verify "BTFOS Ready"
+name: Build and verify boot
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+jobs:
+  build-and-boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm gcc-multilib qemu-system-x86 grub-pc-bin xorriso
+      - name: Build kernel
+        run: make
+      - name: Build ISO
+        run: |
+          mkdir -p iso/boot/grub
+          cp btfos.elf iso/boot/
+          cp iso/boot/grub/grub.cfg iso/boot/grub/
+          grub-mkrescue -o btfos.iso iso
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: btfos-iso
+          path: btfos.iso
+      - name: Verify boot in QEMU
+        run: |
+          timeout 5 make run 2>&1 | tee serial.log
+          grep -q "BTFOS Ready" serial.log && echo "BOOT_VERIFIED=yes" >> $GITHUB_ENV
+      - name: Assert boot success
+        run: |
+          if ! grep -q "BTFOS Ready" serial.log; then
+            echo "Boot verification failed. Serial log:"
+            cat serial.log
+            exit 1
+          fi
+          echo "BTFOS boot verified."

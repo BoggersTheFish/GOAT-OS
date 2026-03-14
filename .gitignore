@@ -2,6 +2,10 @@
 *.o
 *.elf
 btfos.elf
+btfos.iso
+
+# Verify
+serial.log
 
 # Editor / OS
 .DS_Store

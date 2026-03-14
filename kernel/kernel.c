@@ -329,6 +329,28 @@ static int sys_write(int fd, const void *buf, size_t n) {
     (void)buf;
     return (int)n;
 }
+static int sys_open(const char *path, int flags) {
+    syscall_ingest(current_pid, "open", (uint32_t)(uintptr_t)path, (uint32_t)flags);
+    return 0;
+}
+static void sys_close(int fd) {
+    syscall_ingest(current_pid, "close", (uint32_t)fd, 0);
+}
+static void sys_exit(int code) {
+    syscall_ingest(current_pid, "exit", (uint32_t)code, 0);
+    (void)code;
+}
+static uint32_t sys_getpid(void) {
+    return current_pid;
+}
+static void sys_yield(void) {
+    syscall_ingest(current_pid, "yield", 0, 0);
+    cognition_loop();
+}
+static uint32_t sys_gettime(void) {
+    syscall_ingest(current_pid, "gettime", 0, 0);
+    return tick_count;
+}
 
 /* ==================== In-memory FS (triples) ==================== */
 typedef struct {
@@ -348,6 +370,27 @@ static void fs_init(void) {
     for (int i = 0; i < 31 && s[i]; i++) t->subj[i] = s[i];
     for (int i = 0; i < 31 && p[i]; i++) t->pred[i] = p[i];
     for (int i = 0; i < 63 && o[i]; i++) t->obj[i] = o[i];
+    /* /boot, /tmp as dirs */
+    const char *dirs[][3] = { {"boot", "type", "dir"}, {"tmp", "type", "dir"} };
+    for (int d = 0; d < 2 && triple_count < BTFOS_MAX_TRIPLES; d++) {
+        triple_t *tr = &triples[triple_count++];
+        for (int i = 0; i < 31 && dirs[d][0][i]; i++) tr->subj[i] = dirs[d][0][i];
+        for (int i = 0; i < 31 && dirs[d][1][i]; i++) tr->pred[i] = dirs[d][1][i];
+        for (int i = 0; i < 63 && dirs[d][2][i]; i++) tr->obj[i] = dirs[d][2][i];
+    }
+}
+static void fs_mkdir(const char *path) {
+    if (triple_count >= BTFOS_MAX_TRIPLES) return;
+    triple_t *t = &triples[triple_count++];
+    int i;
+    for (i = 0; i < 31 && path[i]; i++) t->subj[i] = path[i]; t->subj[i] = '\0';
+    const char *p = "type", *o = "dir";
+    for (i = 0; i < 31 && p[i]; i++) t->pred[i] = p[i]; t->pred[i] = '\0';
+    for (i = 0; i < 63 && o[i]; i++) t->obj[i] = o[i]; t->obj[i] = '\0';
+}
+static void fs_stat(const char *path) {
+    const char *type = fs_lookup(path, "type");
+    if (type) { log_str("stat "); log_str(path); log_str(" type="); log_str(type); log_str("\n"); }
 }
 static void fs_ingest_file(const char *path, const char *content) {
     if (triple_count >= BTFOS_MAX_TRIPLES - 2) return;
@@ -425,7 +468,7 @@ static void shell_ingest_command(const char *cmd) {
 }
 static void shell_reason_output(const char *cmd) {
     if (cmd[0] == 'h' && cmd[1] == 'e' && cmd[2] == 'l' && cmd[3] == 'p') {
-        log_str("help: help | status | run | exit\n");
+        log_str("help: help | status | run | exit | bench | stat <path>\n");
         return;
     }
     if (cmd[0] == 's' && cmd[1] == 't' && cmd[2] == 'a' && cmd[3] == 't' && cmd[4] == 'u' && cmd[5] == 's') {
@@ -442,6 +485,14 @@ static void shell_reason_output(const char *cmd) {
     }
     if (cmd[0] == 'e' && cmd[1] == 'x' && cmd[2] == 'i' && cmd[3] == 't') {
         log_str("bye.\n");
+        return;
+    }
+    if (cmd[0] == 'b' && cmd[1] == 'e' && cmd[2] == 'n' && cmd[3] == 'c' && cmd[4] == 'h') {
+        log_str("time="); log_u32(sys_gettime()); log_str("\n");
+        return;
+    }
+    if (cmd[0] == 's' && cmd[1] == 't' && cmd[2] == 'a' && cmd[3] == 't' && cmd[4] == ' ') {
+        fs_stat((const char *)&cmd[5]);
         return;
     }
     log_str("unknown cmd. try help\n");
@@ -490,19 +541,31 @@ void kernel_main(uint32_t magic, uint32_t mb_info_phys) {
     current_pid = 1;
     process_get(1)->state = PROC_RUN;
     log_str("BTFOS Ready\n");
-    /* Run cognition loop a few times */
+    /* Run cognition loop a few times (skip in benchmark mode; we run below) */
+#if !BTFOS_BENCHMARK_MODE
     for (int i = 0; i < BTFOS_TICKS_PER_LOOP; i++)
         cognition_loop();
+#endif
     monitor_export();
     self_assess_scan();
     plugins_log();
     /* Shell: one demo command */
     shell_step();
     log_str("BTFOS shell ok.\n");
+#if BTFOS_BENCHMARK_MODE
+    /* Benchmark: run BTFOS_TICKS_PER_LOOP cognition ticks then report */
+    for (uint32_t i = 0; i < (uint32_t)BTFOS_TICKS_PER_LOOP; i++)
+        cognition_loop();
+    log_str("{\"benchmark_ticks\":");
+    log_u32(tick_count);
+    log_str(",\"benchmark_done\":1}\n");
+    log_str("BTFOS benchmark done.\n");
+#else
     for (;;) {
         cognition_loop();
         if (tick_count > 1000) break; /* exit demo after 1000 ticks */
     }
+#endif
     log_str("BTFOS halt.\n");
     for (;;) __asm__ volatile ("hlt");
 }

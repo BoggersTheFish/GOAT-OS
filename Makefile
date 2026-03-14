@@ -35,3 +35,11 @@ run: $(TARGET)
 # Run with VGA visible
 run-vga: $(TARGET)
 	qemu-system-i386 -kernel $(TARGET) -serial stdio
+
+# Bootable ISO (requires grub-mkrescue)
+iso: $(TARGET)
+	mkdir -p iso/boot/grub
+	cp $(TARGET) iso/boot/btfos.elf
+	cp iso/boot/grub/grub.cfg iso/boot/grub/
+	grub-mkrescue -o btfos.iso iso
+	@echo "btfos.iso ready. Run: qemu-system-i386 -cdrom btfos.iso -serial stdio"

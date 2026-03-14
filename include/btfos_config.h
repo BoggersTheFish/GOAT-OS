@@ -2,7 +2,7 @@
 #ifndef BTFOS_CONFIG_H
 #define BTFOS_CONFIG_H
 
-/* Presets: BTFOS_BOOT (lightweight), BTFOS_NORMAL, BTFOS_FULL */
+/* Presets: BTFOS_BOOT (lightweight), BTFOS_NORMAL, BTFOS_FULL, BTFOS_LOW_POWER, BTFOS_BENCHMARK */
 #define BTFOS_PRESET BTFOS_NORMAL
 
 #if BTFOS_PRESET == BTFOS_BOOT
@@ -12,6 +12,18 @@
 #define BTFOS_ENABLE_CURIOSITY  0
 #define BTFOS_ENABLE_GOALS      0
 #define BTFOS_SHARD_COUNT       1
+#define BTFOS_BENCHMARK_MODE    0
+#elif BTFOS_PRESET == BTFOS_LOW_POWER
+/* Fewer graph ops for low-power CPUs (e.g. Pentium Silver); no reflection in hot path */
+#define BTFOS_TICKS_PER_LOOP     5
+#define BTFOS_ENABLE_FORCES      0
+#define BTFOS_ENABLE_REFLECTION  0
+#define BTFOS_ENABLE_CURIOSITY  0
+#define BTFOS_ENABLE_GOALS      0
+#define BTFOS_SHARD_COUNT       1
+#define BTFOS_BENCHMARK_MODE    0
+#define BTFOS_MAX_GRAPH_NODES   128
+#define BTFOS_MAX_EDGES         256
 #elif BTFOS_PRESET == BTFOS_NORMAL
 #define BTFOS_TICKS_PER_LOOP     10
 #define BTFOS_ENABLE_FORCES      1
@@ -19,6 +31,15 @@
 #define BTFOS_ENABLE_CURIOSITY  1
 #define BTFOS_ENABLE_GOALS      1
 #define BTFOS_SHARD_COUNT       2
+#define BTFOS_BENCHMARK_MODE    0
+#elif BTFOS_PRESET == BTFOS_BENCHMARK
+#define BTFOS_TICKS_PER_LOOP     10000
+#define BTFOS_ENABLE_FORCES      1
+#define BTFOS_ENABLE_REFLECTION  1
+#define BTFOS_ENABLE_CURIOSITY  1
+#define BTFOS_ENABLE_GOALS      1
+#define BTFOS_SHARD_COUNT       2
+#define BTFOS_BENCHMARK_MODE    1
 #else /* BTFOS_FULL */
 #define BTFOS_TICKS_PER_LOOP     100
 #define BTFOS_ENABLE_FORCES      1
@@ -26,12 +47,18 @@
 #define BTFOS_ENABLE_CURIOSITY  1
 #define BTFOS_ENABLE_GOALS      1
 #define BTFOS_SHARD_COUNT       4
+#define BTFOS_BENCHMARK_MODE    0
+#endif
+
+#ifndef BTFOS_MAX_GRAPH_NODES
+#define BTFOS_MAX_GRAPH_NODES   512
+#endif
+#ifndef BTFOS_MAX_EDGES
+#define BTFOS_MAX_EDGES         1024
 #endif
 
 #define BTFOS_MAX_PROCESSES     32
 #define BTFOS_MAX_PAGES         256
-#define BTFOS_MAX_GRAPH_NODES   512
-#define BTFOS_MAX_EDGES         1024
 #define BTFOS_MAX_TRIPLES       256
 #define BTFOS_MAX_SYSCALL_LOG   64
 #define BTFOS_SHELL_BUF         128
