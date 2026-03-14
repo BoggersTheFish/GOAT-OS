@@ -65,4 +65,16 @@
 #define BTFOS_PLUGIN_DIR        "/plugins"
 #define BTFOS_KERNEL_SOURCE_TAG "btfos_kernel_v1"
 
+/* Cognition preset levels (numeric for comparison in kernel) */
+#define BTFOS_BOOT_LIGHT  1
+#define BTFOS_BOOT_NORMAL 2
+#define BTFOS_BOOT_FULL   3
+#if BTFOS_PRESET == BTFOS_FULL
+#define BTFOS_BOOT_PRESET BTFOS_BOOT_FULL
+#elif BTFOS_PRESET == BTFOS_NORMAL || BTFOS_PRESET == BTFOS_BENCHMARK
+#define BTFOS_BOOT_PRESET BTFOS_BOOT_NORMAL
+#else
+#define BTFOS_BOOT_PRESET BTFOS_BOOT_LIGHT
+#endif
+
 #endif
