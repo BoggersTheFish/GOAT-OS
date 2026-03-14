@@ -6,6 +6,27 @@ Format: **[Update N]** – short title, then detailed list.
 
 ---
 
+## [Update 5] – Basic syscalls, keyboard input, syscall graph ingestion, interactive shell
+
+**Date:** 2025-03
+
+- **Syscalls (real behavior vs stubs)**
+  - `sys_write`: prints to serial+VGA, ingests `(proc:<pid>, write, serial)`, nudges activation.
+  - `sys_read`: reads PS/2 keyboard input (scancode polling), ingests `(proc:<pid>, read, kbd)`, nudges activation.
+  - `sys_exit`: kills current process in pool; respawns init if PID 1 exits; ingests `(proc:<pid>, exit, "")`.
+  - `sys_open/sys_close`: FS stub backed by triple store lookup; ingests open/close triples.
+  - `sys_exec`: spawns a process named by path with parent link; ingests `(proc:<childpid>, exec, path)` and prints spawn info.
+- **Graph/FS provenance**
+  - Added `fs_ingest_syscall(pid, pred, obj)` to store syscall events as triples (`subj=proc:<pid>`), providing provenance signals for cognition.
+- **Keyboard**
+  - Minimal US keymap and blocking `kbd_read_char_blocking()` for interactive input.
+- **Shell**
+  - Upgraded to line-based input. Commands: `help`, `status`, `ps`, `run <task>`, `exit`.
+- **Scheduling**
+  - Timer ticks now increment `ticks`; cognition loop selects the highest-activation runnable process and updates `current_pid`.
+
+---
+
 ## [Update 4] – Timer interrupt, cognition per tick, real process_list
 
 **Date:** 2025-03

@@ -9,6 +9,31 @@
 #include <stddef.h>
 #include "btfos_config.h"
 
+/* ==== Tiny utils (no libc) ==== */
+static void mem_zero(void *p, size_t n) {
+    uint8_t *b = (uint8_t *)p;
+    for (size_t i = 0; i < n; i++)
+        b[i] = 0;
+}
+
+static void u32_to_dec(uint32_t v, char out[12]) {
+    char tmp[12];
+    unsigned int i = 0;
+    if (v == 0) {
+        out[0] = '0';
+        out[1] = '\0';
+        return;
+    }
+    while (v && i < sizeof(tmp)) {
+        tmp[i++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    unsigned int o = 0;
+    while (i > 0)
+        out[o++] = tmp[--i];
+    out[o] = '\0';
+}
+
 /* ----- Port I/O ----- */
 static inline void outb(uint16_t port, uint8_t v) {
     __asm__ volatile ("outb %0, %1" : : "a"(v), "Nd"(port));
@@ -75,10 +100,12 @@ void memory_init(void) { (void)0; }
 
 /* ----- Timer interrupt: periodic cognition tick ----- */
 static volatile uint32_t cognition_tick_pending;
+static volatile uint32_t ticks;
 
 /* Called from asm irq0_entry (IRQ0 = PIT) */
 void timer_irq_handler(void) {
     cognition_tick_pending = 1;
+    ticks++;
     outb(0x20, 0x20);   /* PIC1 EOI */
 }
 
@@ -139,6 +166,39 @@ static void pit_init(void) {
     outb(0x43, 0x36);
     outb(0x40, (uint8_t)(PIT_DIVISOR & 0xFF));
     outb(0x40, (uint8_t)((PIT_DIVISOR >> 8) & 0xFF));
+}
+
+/* ----- Keyboard (very tiny, polling scancodes) ----- */
+static const char scancode_to_ascii[128] = {
+    0,  27, '1','2','3','4','5','6','7','8','9','0','-','=', '\b',
+    '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n', 0,
+    'a','s','d','f','g','h','j','k','l',';','\'','`', 0,'\\',
+    'z','x','c','v','b','n','m',',','.','/', 0, '*', 0, ' ',
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+static int kbd_has_data(void) {
+    return (inb(0x64) & 1) != 0;
+}
+
+static char kbd_read_char_blocking(void) {
+    for (;;) {
+        if (!kbd_has_data()) {
+            __asm__ volatile ("hlt");
+            continue;
+        }
+        uint8_t sc = inb(0x60);
+        if (sc & 0x80) /* key up */
+            continue;
+        if (sc < 128) {
+            char c = scancode_to_ascii[sc];
+            if (c)
+                return c;
+        }
+    }
 }
 
 /* ----- Graph (GOAT-TS): nodes = pid, activation, state, mass, position; edges = relations (from/to/weight). create/destroy/add_node/add_edge, spread_activation, decay_states, apply_forces, curiosity, reflection, goal_generator, sandbox_test, get_activation, get_state. ----- */
@@ -328,38 +388,79 @@ static int graph_get_state(graph_t *g, uint32_t pid) {
 
 /* ----- Process (stub list; mass/position for graph integration) ----- */
 typedef struct process process_t;
+typedef enum { PROC_READY = 0, PROC_RUN = 1, PROC_ZOMBIE = 2 } proc_state_t;
 struct process {
     uint32_t pid;
     float activation;
-    int state;
+    int state;        /* proc_state_t */
     float mass;      /* for graph_add_node */
     float pos_x;
     float pos_y;
+    char name[16];
     process_t *parent;
     process_t *next;
 };
 
 static process_t process_pool[BTFOS_MAX_PROCESSES];
 static unsigned int process_count;
+static uint32_t next_pid = 1;
+static uint32_t current_pid = 0;
 
 void process_init(void) {
     process_count = 0;
+    next_pid = 1;
+    current_pid = 0;
     for (unsigned int i = 0; i < BTFOS_MAX_PROCESSES; i++)
         process_pool[i].pid = 0;
+}
+
+static process_t *process_get(uint32_t pid) {
+    for (unsigned int i = 0; i < BTFOS_MAX_PROCESSES; i++)
+        if (process_pool[i].pid == pid)
+            return &process_pool[i];
+    return NULL;
+}
+
+static process_t *process_spawn(const char *name, process_t *parent) {
+    for (unsigned int i = 0; i < BTFOS_MAX_PROCESSES; i++) {
+        if (process_pool[i].pid != 0)
+            continue;
+        process_pool[i].pid = next_pid++;
+        process_pool[i].activation = 0.6f;
+        process_pool[i].state = PROC_READY;
+        process_pool[i].mass = 1.0f;
+        process_pool[i].pos_x = (float)(process_pool[i].pid % 7);
+        process_pool[i].pos_y = (float)((process_pool[i].pid / 7) % 7);
+        mem_zero(process_pool[i].name, sizeof(process_pool[i].name));
+        if (name) {
+            for (unsigned int k = 0; k < sizeof(process_pool[i].name) - 1 && name[k]; k++)
+                process_pool[i].name[k] = name[k];
+        }
+        process_pool[i].parent = parent;
+        process_pool[i].next = NULL;
+        process_count++;
+        return &process_pool[i];
+    }
+    return NULL;
+}
+
+static void process_kill(uint32_t pid) {
+    for (unsigned int i = 0; i < BTFOS_MAX_PROCESSES; i++) {
+        if (process_pool[i].pid == pid) {
+            process_pool[i].pid = 0;
+            process_pool[i].state = PROC_ZOMBIE;
+            process_pool[i].activation = 0.0f;
+            process_count = (process_count > 0) ? (process_count - 1) : 0;
+            return;
+        }
+    }
 }
 
 /* Return real process list: all entries in process_pool with pid != 0, linked by .next (ingest for graph) */
 process_t *process_list(void) {
     if (process_count == 0) {
-        process_pool[0].pid = 1;
-        process_pool[0].activation = 0.6f;
-        process_pool[0].state = 0;
-        process_pool[0].mass = 1.0f;
-        process_pool[0].pos_x = 0.0f;
-        process_pool[0].pos_y = 0.0f;
-        process_pool[0].parent = NULL;
-        process_pool[0].next = NULL;
-        process_count = 1;
+        (void)process_spawn("init", NULL);
+        current_pid = 1;
     }
     /* Build linked list from pool (all active processes) */
     process_t *head = NULL;
@@ -425,6 +526,36 @@ void fs_init(void) {
 
 /* Forward declare so fs_ingest_file can use it without implicit declaration */
 const char *fs_lookup(const char *subj, const char *pred);
+
+static void fs_write_cstr(char *dst, size_t cap, const char *src) {
+    size_t i = 0;
+    if (!dst || cap == 0) return;
+    while (i + 1 < cap && src && src[i]) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+/* Ingest syscall as a triple into FS: subj=proc:<pid>, pred, obj */
+static void fs_ingest_syscall(uint32_t pid, const char *pred, const char *obj) {
+    triple_t *t = fs_alloc_triple();
+    if (!t)
+        return;
+    char pidbuf[12];
+    u32_to_dec(pid, pidbuf);
+
+    /* subj = "proc:" + pid */
+    size_t o = 0;
+    const char *prefix = "proc:";
+    for (size_t i = 0; i < 31 && prefix[i]; i++) t->subj[o++] = prefix[i];
+    for (size_t i = 0; i < 31 && pidbuf[i] && o < 31; i++) t->subj[o++] = pidbuf[i];
+    t->subj[o] = '\0';
+
+    fs_write_cstr(t->pred, sizeof(t->pred), pred ? pred : "syscall");
+    fs_write_cstr(t->obj, sizeof(t->obj), obj ? obj : "");
+    fs_insert_triple(t);
+}
 
 void fs_mkdir(const char *path) {
     triple_t *t = fs_alloc_triple();
@@ -504,6 +635,16 @@ const char *fs_lookup(const char *subj, const char *pred) {
     return NULL;
 }
 
+/* ----- Syscall prototypes (used by shell) ----- */
+int sys_write(int fd, const void *buf, size_t n);
+int sys_read(int fd, void *buf, size_t n);
+void sys_exit(int code);
+int sys_open(const char *path, int flags);
+void sys_close(int fd);
+void sys_exec(const char *path);
+uint32_t sys_getpid(void);
+void sys_yield(void);
+
 /* ----- Shell ----- */
 void shell_ingest_command(const char *cmd) {
     triple_t *t = fs_alloc_triple();
@@ -528,19 +669,91 @@ void shell_ingest_command(const char *cmd) {
     fs_insert_triple(t);
 }
 
-static int shell_cmd_done;
+static char shell_line[80];
 
 void shell_init(void) {
-    shell_cmd_done = 0;
+    /* nothing yet */
+}
+
+static void shell_prompt(void) { monitor_print("> "); }
+
+static int shell_readline(char *buf, unsigned int cap) {
+    if (!buf || cap < 2) return 0;
+    unsigned int n = 0;
+    for (;;) {
+        char c = kbd_read_char_blocking();
+        if (c == '\r') c = '\n';
+        if (c == '\n') {
+            monitor_print("\n");
+            buf[n] = '\0';
+            return (int)n;
+        }
+        if (c == '\b') {
+            if (n > 0) {
+                n--;
+                monitor_print("\b \b");
+            }
+            continue;
+        }
+        if (n + 1 < cap) {
+            buf[n++] = c;
+            char out[2] = { c, 0 };
+            monitor_print(out);
+        }
+    }
 }
 
 void shell_run(void) {
-    /* Single-shot: print prompt and ingest one "status" command */
-    if (shell_cmd_done == 0) {
-        shell_ingest_command("status");
-        monitor_print("tick=0 procs=1\n");
-        shell_cmd_done = 1;
+    shell_prompt();
+    int n = shell_readline(shell_line, (unsigned int)sizeof(shell_line));
+    if (n <= 0)
+        return;
+
+    shell_ingest_command(shell_line);
+
+    /* Built-ins: help | status | ps | run <task> | exit */
+    if (shell_line[0] == 'h') {
+        monitor_print("help: status | ps | run <task> | exit\n");
+        return;
     }
+    if (shell_line[0] == 's') {
+        monitor_print("ticks=");
+        char tb[12];
+        u32_to_dec(ticks, tb);
+        monitor_print(tb);
+        monitor_print(" procs=");
+        char pb[12];
+        u32_to_dec(process_count, pb);
+        monitor_print(pb);
+        monitor_print("\n");
+        return;
+    }
+    if (shell_line[0] == 'p' && shell_line[1] == 's') {
+        process_t *p = process_list();
+        while (p) {
+            monitor_print("pid=");
+            char b[12];
+            u32_to_dec(p->pid, b);
+            monitor_print(b);
+            monitor_print(" act=");
+            monitor_print(p->activation > 0.5f ? "hi" : "lo");
+            monitor_print(" name=");
+            monitor_print(p->name);
+            monitor_print("\n");
+            p = p->next;
+        }
+        return;
+    }
+    if (shell_line[0] == 'r' && shell_line[1] == 'u' && shell_line[2] == 'n' && shell_line[3] == ' ') {
+        sys_exec(&shell_line[4]);
+        return;
+    }
+    if (shell_line[0] == 'e' && shell_line[1] == 'x' && shell_line[2] == 'i' && shell_line[3] == 't') {
+        monitor_print("bye.\n");
+        for (;;)
+            __asm__ volatile ("hlt");
+    }
+    monitor_print("unknown. try: help\n");
 }
 
 /* ----- Cognition loop (GOAT-TS): ingest processes -> graph, spread/decay/forces, then curiosity/reflection/goal/sandbox per preset, update processes ----- */
@@ -577,47 +790,113 @@ void cognition_loop(int preset) {
         p->state = graph_get_state(g, p->pid);
     }
 
+    /* Scheduling decision: choose highest-activation runnable process */
+    float best = -1.0f;
+    uint32_t best_pid = current_pid;
+    for (process_t *p = processes; p; p = p->next) {
+        if (p->state == PROC_ZOMBIE)
+            continue;
+        if (p->activation > best) {
+            best = p->activation;
+            best_pid = p->pid;
+        }
+    }
+    current_pid = best_pid;
+    process_t *curp = process_get(current_pid);
+    if (curp)
+        curp->state = PROC_RUN;
+
     graph_destroy(g);
 }
 
 /* ----- Syscall stubs (unused params silenced) ----- */
 void sys_exit(int code) {
     (void)code;
+    uint32_t pid = current_pid;
+    fs_ingest_syscall(pid, "exit", "");
+    process_kill(pid);
+    if (pid == 1) {
+        (void)process_spawn("init", NULL);
+        current_pid = 1;
+    }
 }
 
 uint32_t sys_getpid(void) {
-    return 0;
+    return current_pid;
 }
 
 void sys_yield(void) {
+    /* Cooperative yield: just run one cognition cycle (graph-driven reschedule) */
+    cognition_tick_pending = 1;
 }
 
 int sys_write(int fd, const void *buf, size_t n) {
     (void)fd;
-    (void)buf;
-    (void)n;
-    return 0;
+    const char *c = (const char *)buf;
+    if (!c)
+        return 0;
+    for (size_t i = 0; i < n; i++) {
+        char out[2] = { c[i], 0 };
+        monitor_print(out);
+    }
+    fs_ingest_syscall(current_pid, "write", "serial");
+    process_t *p = process_get(current_pid);
+    if (p && p->activation < 1.0f)
+        p->activation += 0.02f;
+    return (int)n;
 }
 
 int sys_read(int fd, void *buf, size_t n) {
     (void)fd;
-    (void)buf;
-    (void)n;
-    return 0;
+    char *c = (char *)buf;
+    if (!c || n == 0)
+        return 0;
+    size_t i = 0;
+    while (i < n) {
+        char ch = kbd_read_char_blocking();
+        c[i++] = ch;
+        if (ch == '\n')
+            break;
+    }
+    fs_ingest_syscall(current_pid, "read", "kbd");
+    process_t *p = process_get(current_pid);
+    if (p && p->activation < 1.0f)
+        p->activation += 0.01f;
+    return (int)i;
 }
 
 int sys_open(const char *path, int flags) {
-    (void)path;
     (void)flags;
-    return 0;
+    const char *t = fs_lookup(path ? path : "", "type");
+    fs_ingest_syscall(current_pid, "open", path ? path : "");
+    return t ? 1 : -1;
 }
 
 void sys_close(int fd) {
     (void)fd;
+    fs_ingest_syscall(current_pid, "close", "");
 }
 
 void sys_exec(const char *path) {
-    (void)path;
+    /* \"Load\" a simple task: spawn a process with name=path and add parent edge via parent ptr */
+    process_t *parent = process_get(current_pid);
+    process_t *child = process_spawn(path ? path : "task", parent);
+    if (child) {
+        child->activation = 0.7f;
+        child->state = PROC_READY;
+        fs_ingest_syscall(child->pid, "exec", path ? path : "");
+        if (parent && parent->activation < 1.0f)
+            parent->activation += 0.03f;
+        monitor_print("spawned ");
+        monitor_print(child->name);
+        monitor_print(" pid=");
+        char b[12];
+        u32_to_dec(child->pid, b);
+        monitor_print(b);
+        monitor_print("\n");
+    } else {
+        monitor_print("spawn failed\n");
+    }
 }
 
 /* ----- Kernel entry (called from boot.asm with magic, multiboot info) ----- */
@@ -642,6 +921,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
     pic_init();
     pit_init();
     cognition_tick_pending = 0;
+    ticks = 0;
 
     int preset = BTFOS_BOOT_PRESET;
     cognition_loop(preset);   /* one initial run before "Ready" */
