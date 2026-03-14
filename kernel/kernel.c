@@ -73,37 +73,64 @@ static void monitor_print(const char *s) {
 /* ----- Memory (stub) ----- */
 void memory_init(void) { (void)0; }
 
-/* ----- Graph (GOAT-TS style) ----- */
+/* ----- Graph (GOAT-TS): nodes = pid, activation, state, mass, position; edges = relations (from/to/weight). create/destroy/add_node/add_edge, spread_activation, decay_states, apply_forces, curiosity, reflection, goal_generator, sandbox_test, get_activation, get_state. ----- */
 typedef struct graph_node_inner {
     uint32_t pid;
     float activation;
     int state;
+    float mass;       /* for force sim / priority weighting */
+    float pos_x;     /* 2D position for force-directed layout / affinity */
+    float pos_y;
     struct graph_node_inner *next;
 } graph_node_inner_t;
+
+typedef struct graph_edge_inner {
+    uint32_t from_pid;
+    uint32_t to_pid;
+    float weight;    /* relation strength (e.g. child_of -> 0.8) */
+    struct graph_edge_inner *next;
+} graph_edge_inner_t;
 
 typedef struct graph_t {
     graph_node_inner_t *nodes;
     graph_node_inner_t *last;
+    graph_edge_inner_t *edges;
+    graph_edge_inner_t *edges_last;
 } graph_t;
 
 static graph_node_inner_t graph_node_pool[BTFOS_MAX_GRAPH_NODES];
+static graph_edge_inner_t graph_edge_pool[BTFOS_MAX_EDGES];
 static unsigned int graph_pool_idx;
+static unsigned int graph_edge_idx;
 
+/* Create fresh graph; resets node/edge pools for this cognition tick */
 static graph_t *graph_create(void) {
     static graph_t g;
     g.nodes = NULL;
     g.last = NULL;
+    g.edges = NULL;
+    g.edges_last = NULL;
     graph_pool_idx = 0;
+    graph_edge_idx = 0;
     return &g;
 }
 
-static void graph_add_node(graph_t *g, uint32_t pid, float act, int state) {
+/* Free / tear-down (no-op with static pools; just reset is in create) */
+static void graph_destroy(graph_t *g) {
+    (void)g;
+}
+
+/* Add node: pid, activation, state, mass, position (for forces / layout) */
+static void graph_add_node(graph_t *g, uint32_t pid, float act, int state, float mass, float pos_x, float pos_y) {
     if (graph_pool_idx >= BTFOS_MAX_GRAPH_NODES)
         return;
     graph_node_inner_t *n = &graph_node_pool[graph_pool_idx++];
     n->pid = pid;
     n->activation = act;
     n->state = state;
+    n->mass = mass;
+    n->pos_x = pos_x;
+    n->pos_y = pos_y;
     n->next = NULL;
     if (g->last)
         g->last->next = n;
@@ -112,77 +139,134 @@ static void graph_add_node(graph_t *g, uint32_t pid, float act, int state) {
     g->last = n;
 }
 
+/* Add edge: relation from -> to with strength (kind maps to weight; e.g. "child_of" -> 0.8) */
 static void graph_add_edge(graph_t *g, uint32_t from, uint32_t to, const char *kind) {
-    (void)g;
-    (void)from;
-    (void)to;
-    (void)kind;
+    if (graph_edge_idx >= BTFOS_MAX_EDGES)
+        return;
+    float w = 0.5f;
+    if (kind && kind[0] == 'c' && kind[1] == 'h') /* child_of */
+        w = 0.8f;
+    graph_edge_inner_t *e = &graph_edge_pool[graph_edge_idx++];
+    e->from_pid = from;
+    e->to_pid = to;
+    e->weight = w;
+    e->next = NULL;
+    if (g->edges_last)
+        g->edges_last->next = e;
+    else
+        g->edges = e;
+    g->edges_last = e;
 }
 
+/* Find node by pid (used by spread/forces) */
+static graph_node_inner_t *graph_find_node(graph_t *g, uint32_t pid) {
+    graph_node_inner_t *n;
+    for (n = g->nodes; n; n = n->next)
+        if (n->pid == pid)
+            return n;
+    return NULL;
+}
+
+/* Spread activation along edges: high-activation nodes boost neighbors (scheduling priority) */
 static void graph_spread_activation(graph_t *g, void *seeds, float decay) {
     (void)seeds;
-    (void)decay;
-    graph_node_inner_t *n;
-    for (n = g->nodes; n; n = n->next) {
-        if (n->activation > 0.05f)
-            n->activation *= 0.9f;
+    /* First pass: push activation along each edge (to += from * weight * factor) */
+    graph_edge_inner_t *e;
+    for (e = g->edges; e; e = e->next) {
+        graph_node_inner_t *from_n = graph_find_node(g, e->from_pid);
+        graph_node_inner_t *to_n = graph_find_node(g, e->to_pid);
+        if (from_n && to_n && to_n->activation < 1.0f) {
+            float add = from_n->activation * e->weight * 0.15f;
+            if (to_n->activation + add > 1.0f)
+                to_n->activation = 1.0f;
+            else
+                to_n->activation += add;
+        }
+    }
+    /* Then decay all (so we don't blow up) */
+    for (graph_node_inner_t *n = g->nodes; n; n = n->next) {
+        if (n->activation > 0.02f)
+            n->activation *= decay;
+        if (n->activation > 1.0f)
+            n->activation = 1.0f;
     }
 }
 
+/* Decay states: slowly reduce activation over time (forgetting) */
 static void graph_decay_states(graph_t *g) {
-    graph_node_inner_t *n;
-    for (n = g->nodes; n; n = n->next)
-        (void)n;
+    for (graph_node_inner_t *n = g->nodes; n; n = n->next) {
+        if (n->activation > 0.05f)
+            n->activation *= 0.97f;
+    }
 }
 
+/* Apply forces: move position toward connected nodes (affinity / load-balance vibe) */
 static void graph_apply_forces(graph_t *g) {
-    (void)g;
+    graph_edge_inner_t *e;
+    for (e = g->edges; e; e = e->next) {
+        graph_node_inner_t *from_n = graph_find_node(g, e->from_pid);
+        graph_node_inner_t *to_n = graph_find_node(g, e->to_pid);
+        if (!from_n || !to_n)
+            continue;
+        /* Gentle pull: to moves a bit toward from (weighted by edge) */
+        float dx = from_n->pos_x - to_n->pos_x;
+        float dy = from_n->pos_y - to_n->pos_y;
+        float step = 0.02f * e->weight;
+        to_n->pos_x += dx * step;
+        to_n->pos_y += dy * step;
+    }
 }
 
+/* Curiosity: boost low-activation nodes (idle resource reuse) */
 static void graph_curiosity(graph_t *g) {
-    (void)g;
+    for (graph_node_inner_t *n = g->nodes; n; n = n->next) {
+        if (n->activation < 0.3f)
+            n->activation += 0.05f;
+    }
 }
 
+/* Reflection: global tension proxy; if high, could log or nudge (bottleneck detection) */
 static void graph_reflection(graph_t *g) {
-    (void)g;
+    float sum = 0.0f;
+    unsigned int cnt = 0;
+    for (graph_node_inner_t *n = g->nodes; n; n = n->next) {
+        sum += (1.0f - n->activation);
+        cnt++;
+    }
+    (void)sum;
+    (void)cnt;
+    /* Tension = avg(1-act). High tension -> many low-act nodes. Stub: no log in kernel for now */
 }
 
+/* Goal generator: stub (could set goal state on high-priority nodes) */
 static void graph_goal_generator(graph_t *g) {
     (void)g;
 }
 
+/* Sandbox test: stub (safe-to-apply change check) */
 static void graph_sandbox_test(graph_t *g) {
     (void)g;
 }
 
 static float graph_get_activation(graph_t *g, uint32_t pid) {
-    graph_node_inner_t *n;
-    for (n = g->nodes; n; n = n->next) {
-        if (n->pid == pid)
-            return n->activation;
-    }
-    return 0.5f;
+    graph_node_inner_t *n = graph_find_node(g, pid);
+    return n ? n->activation : 0.5f;
 }
 
 static int graph_get_state(graph_t *g, uint32_t pid) {
-    graph_node_inner_t *n;
-    for (n = g->nodes; n; n = n->next) {
-        if (n->pid == pid)
-            return n->state;
-    }
-    return 0;
+    graph_node_inner_t *n = graph_find_node(g, pid);
+    return n ? n->state : 0;
 }
 
-static void graph_destroy(graph_t *g) {
-    (void)g;
-}
-
-/* ----- Process ----- */
+/* ----- Process (stub list; mass/position for graph integration) ----- */
 typedef struct process process_t;
 struct process {
     uint32_t pid;
     float activation;
     int state;
+    float mass;      /* for graph_add_node */
+    float pos_x;
+    float pos_y;
     process_t *parent;
     process_t *next;
 };
@@ -196,11 +280,15 @@ void process_init(void) {
         process_pool[i].pid = 0;
 }
 
+/* Stub: return list of processes (single bootstrap process if empty) */
 process_t *process_list(void) {
     if (process_count == 0) {
         process_pool[0].pid = 1;
         process_pool[0].activation = 0.6f;
         process_pool[0].state = 0;
+        process_pool[0].mass = 1.0f;
+        process_pool[0].pos_x = 0.0f;
+        process_pool[0].pos_y = 0.0f;
         process_pool[0].parent = NULL;
         process_pool[0].next = NULL;
         process_count = 1;
@@ -373,23 +461,27 @@ void shell_run(void) {
     }
 }
 
-/* ----- Cognition loop (GOAT-TS) ----- */
+/* ----- Cognition loop (GOAT-TS): ingest processes -> graph, spread/decay/forces, then curiosity/reflection/goal/sandbox per preset, update processes ----- */
 void cognition_loop(int preset) {
     graph_t *g = graph_create();
     process_t *processes = process_list();
 
+    /* Ingest: add each process as node (pid, activation, state, mass, position), edges from parent */
     for (process_t *p = processes; p; p = p->next) {
-        graph_add_node(g, p->pid, p->activation, p->state);
+        graph_add_node(g, p->pid, p->activation, p->state, p->mass, p->pos_x, p->pos_y);
         if (p->parent)
             graph_add_edge(g, p->pid, p->parent->pid, "child_of");
     }
 
+    /* Always: spread activation (scheduling priority), then decay */
     graph_spread_activation(g, NULL, 0.85f);
     graph_decay_states(g);
 
+    /* Forces if enabled (preset >= NORMAL): affinity / position updates */
     if (preset >= BTFOS_BOOT_NORMAL)
         graph_apply_forces(g);
 
+    /* Full preset only: curiosity, reflection, goal generator, sandbox test */
     if (preset == BTFOS_BOOT_FULL) {
         graph_curiosity(g);
         graph_reflection(g);
@@ -397,6 +489,7 @@ void cognition_loop(int preset) {
         graph_sandbox_test(g);
     }
 
+    /* Write back: update process activation/state from graph */
     for (process_t *p = processes; p; p = p->next) {
         p->activation = graph_get_activation(g, p->pid);
         p->state = graph_get_state(g, p->pid);

@@ -6,6 +6,21 @@ Format: **[Update N]** – short title, then detailed list.
 
 ---
 
+## [Update 3] – Graph struct (nodes/edges), cognition loop integration
+
+**Date:** 2025-03
+
+- **Graph implementation**
+  - Nodes: `pid`, `activation`, `state`, `mass`, `pos_x`, `pos_y`. Edges: `from_pid`, `to_pid`, `weight` (relations).
+  - Functions: `graph_create`, `graph_destroy`, `graph_add_node` (with mass/position), `graph_add_edge` (kind → weight, e.g. "child_of" 0.8), `graph_spread_activation`, `graph_decay_states`, `graph_apply_forces`, `graph_curiosity`, `graph_reflection`, `graph_goal_generator`, `graph_sandbox_test`, `graph_get_activation`, `graph_get_state`. Internal `graph_find_node` for lookups.
+  - Spread: push activation along edges then decay. Forces: move node positions toward connected nodes. Curiosity: boost low-activation nodes. Reflection: tension stub.
+- **Cognition loop**
+  - Ingest processes into graph (add_node with mass/pos, add_edge for parent). Run spread + decay always; apply_forces if preset ≥ NORMAL; curiosity/reflection/goal/sandbox if preset FULL. Write back activation/state to processes.
+- **Process**
+  - `process_t` extended with `mass`, `pos_x`, `pos_y` for graph integration; bootstrap process defaults 1.0, 0, 0.
+
+---
+
 ## [Update 2] – Kernel compilation fixes, single-file build
 
 **Date:** 2025-03
