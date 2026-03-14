@@ -98,14 +98,15 @@ static void monitor_print(const char *s) {
 /* ----- Memory (stub) ----- */
 void memory_init(void) { (void)0; }
 
-/* ----- Timer interrupt: periodic cognition tick ----- */
-static volatile uint32_t cognition_tick_pending;
+/* ----- Timer interrupt (IRQ0, IDT 32): PIT calls cognition_loop every ~10 ms (100 Hz) ----- */
 static volatile uint32_t ticks;
+/* Preset for cognition_loop; set once in kernel_main so timer handler can call cognition_loop. */
+static int s_cognition_preset;
 
-/* Called from asm irq0_entry (IRQ0 = PIT) */
+/* Called from asm irq0_entry (IRQ0 = PIT). Cognition runs from timer only, not main loop. */
 void timer_irq_handler(void) {
-    cognition_tick_pending = 1;
     ticks++;
+    cognition_loop(s_cognition_preset);
     outb(0x20, 0x20);   /* PIC1 EOI */
 }
 
@@ -160,10 +161,11 @@ static void pic_init(void) {
     outb(0xA1, 0xFF);
 }
 
-/* PIT channel 0: ~10 Hz (~100ms) cognition tick */
-#define PIT_DIVISOR 119318
+/* PIT channel 0 (ports 0x40/0x43): 100 Hz so cognition_loop runs every ~10 ms (timer tick).
+   Divisor = 1193182/100 = 11932. */
+#define PIT_DIVISOR 11932
 static void pit_init(void) {
-    outb(0x43, 0x36);
+    outb(0x43, 0x36);   /* channel 0, mode 3, binary */
     outb(0x40, (uint8_t)(PIT_DIVISOR & 0xFF));
     outb(0x40, (uint8_t)((PIT_DIVISOR >> 8) & 0xFF));
 }
@@ -537,33 +539,33 @@ static void fs_write_cstr(char *dst, size_t cap, const char *src) {
     dst[i] = '\0';
 }
 
-/* Ingest syscall as a triple into FS:
-   subj=<pid> (decimal), pred=\"syscall\", obj=\"<name> <detail>\" (best-effort). */
-static void fs_ingest_syscall(uint32_t pid, const char *name, const char *detail) {
+/* Ingest syscall as triple: subj = process name or pid, pred = "syscall", obj = syscall name + args. */
+static void fs_ingest_syscall_triple(const char *subj, const char *obj_str) {
     triple_t *t = fs_alloc_triple();
     if (!t)
         return;
+    fs_write_cstr(t->subj, sizeof(t->subj), subj ? subj : "0");
+    fs_write_cstr(t->pred, sizeof(t->pred), "syscall");
+    fs_write_cstr(t->obj, sizeof(t->obj), obj_str ? obj_str : "");
+    fs_insert_triple(t);
+}
+
+/* Legacy: ingest by pid and name+detail (builds obj = name + " " + detail). */
+static void fs_ingest_syscall(uint32_t pid, const char *name, const char *detail) {
     char pidbuf[12];
     u32_to_dec(pid, pidbuf);
-
-    /* subj = pid */
-    fs_write_cstr(t->subj, sizeof(t->subj), pidbuf);
-    fs_write_cstr(t->pred, sizeof(t->pred), "syscall");
-
-    /* obj = \"<name> <detail>\" */
-    mem_zero(t->obj, sizeof(t->obj));
+    process_t *p = process_get(pid);
+    const char *subj = (p && p->name[0]) ? p->name : pidbuf;
+    char obj[64];
     size_t o = 0;
-    if (name) {
-        for (size_t i = 0; i + 1 < sizeof(t->obj) && name[i]; i++)
-            t->obj[o++] = name[i];
+    if (name)
+        for (; o + 1 < sizeof(obj) && name[o]; o++) obj[o] = name[o];
+    if (detail && detail[0] && o < sizeof(obj) - 2) {
+        obj[o++] = ' ';
+        for (size_t i = 0; o + 1 < sizeof(obj) && detail[i]; i++, o++) obj[o] = detail[i];
     }
-    if (detail && detail[0] && o + 1 < sizeof(t->obj)) {
-        t->obj[o++] = ' ';
-        for (size_t i = 0; i + 1 < sizeof(t->obj) - o && detail[i]; i++)
-            t->obj[o++] = detail[i];
-    }
-    t->obj[o < sizeof(t->obj) ? o : (sizeof(t->obj) - 1)] = '\0';
-    fs_insert_triple(t);
+    obj[o] = '\0';
+    fs_ingest_syscall_triple(subj, obj);
 }
 
 void fs_mkdir(const char *path) {
@@ -649,7 +651,7 @@ int sys_write(int fd, const void *buf, size_t n);
 int sys_read(int fd, void *buf, size_t n);
 void sys_exit(int code);
 int sys_open(const char *path, int flags);
-void sys_close(int fd);
+int sys_close(int fd);
 void sys_exec(const char *path);
 uint32_t sys_getpid(void);
 void sys_yield(void);
@@ -722,7 +724,7 @@ void shell_run(void) {
 
     /* Built-ins: help | status | ps | run <task> | exit */
     if (shell_line[0] == 'h') {
-        monitor_print("help: status | ps | run <task> | exit\n");
+        monitor_print("help: status | ps | run <task> | echo <text> | read | exit\n");
         return;
     }
     if (shell_line[0] == 's') {
@@ -766,6 +768,30 @@ void shell_run(void) {
         monitor_print("bye.\n");
         for (;;)
             __asm__ volatile ("hlt");
+    }
+    /* echo <text>: write to stdout via sys_write(1, ...). */
+    if (shell_line[0] == 'e' && shell_line[1] == 'c' && shell_line[2] == 'h' && shell_line[3] == 'o' && shell_line[4] == ' ') {
+        static char echo_buf[80];
+        size_t i = 0;
+        size_t j = 5;
+        while (shell_line[j] && i < sizeof(echo_buf) - 2)
+            echo_buf[i++] = shell_line[j++];
+        echo_buf[i++] = '\n';
+        echo_buf[i] = '\0';
+        sys_write(1, echo_buf, i);
+        return;
+    }
+    /* read: read up to 10 bytes from stdin via sys_read(0, ...), then print result. */
+    if (shell_line[0] == 'r' && shell_line[1] == 'e' && shell_line[2] == 'a' && shell_line[3] == 'd' && shell_line[4] == '\0') {
+        static char read_buf[11];
+        int nr = sys_read(0, read_buf, 10);
+        if (nr > 0) {
+            for (int i = 0; i < nr; i++) {
+                char out[2] = { read_buf[i], 0 };
+                monitor_print(out);
+            }
+        }
+        return;
     }
     monitor_print("unknown. try: help\n");
 }
@@ -823,15 +849,105 @@ void cognition_loop(int preset) {
     graph_destroy(g);
 }
 
-/* ----- Syscall stubs (unused params silenced) ----- */
+/* ----- Real syscalls: minimal implementations, each ingests triple (subj=pid/name, pred=syscall, obj=name+args) ----- */
+
+/* Serial transmit: wait for THRE (LSR bit 5 at 0x3FD) then send one byte to 0x3F8. */
+static void serial_putc_blocking(char c) {
+    while ((inb(SERIAL_PORT + 5) & 0x20) == 0)
+        ;
+    outb(SERIAL_PORT, c);
+}
+
+/* sys_write: if fd==1, write buf to serial 0x3F8 (loop until each byte transmitted). Else return -1. */
+int sys_write(int fd, const void *buf, size_t n) {
+    if (fd != 1 || !buf) {
+        char obj[32];
+        obj[0] = 'w'; obj[1] = 'r'; obj[2] = 'i'; obj[3] = 't'; obj[4] = 'e';
+        obj[5] = ' '; obj[6] = '0' + (fd % 10); obj[7] = ' '; obj[8] = '0'; obj[9] = '\0';
+        process_t *p = process_get(current_pid);
+        char pidbuf[12];
+        u32_to_dec(current_pid, pidbuf);
+        fs_ingest_syscall_triple((p && p->name[0]) ? p->name : pidbuf, obj);
+        return fd == 1 ? 0 : -1;
+    }
+    const char *c = (const char *)buf;
+    for (size_t i = 0; i < n; i++)
+        serial_putc_blocking(c[i]);
+    char obj[32];
+    size_t o = 0;
+    obj[o++] = 'w'; obj[o++] = 'r'; obj[o++] = 'i'; obj[o++] = 't'; obj[o++] = 'e';
+    obj[o++] = ' '; obj[o++] = '1'; obj[o++] = ' ';
+    char nb[12];
+    u32_to_dec((uint32_t)n, nb);
+    for (size_t i = 0; nb[i] && o < sizeof(obj) - 1; i++) obj[o++] = nb[i];
+    obj[o] = '\0';
+    process_t *p = process_get(current_pid);
+    char pidbuf[12];
+    u32_to_dec(current_pid, pidbuf);
+    fs_ingest_syscall_triple((p && p->name[0]) ? p->name : pidbuf, obj);
+    process_t *pp = process_get(current_pid);
+    if (pp && pp->activation < 1.0f)
+        pp->activation += 0.02f;
+    return (int)n;
+}
+
+/* sys_read: if fd==0, read from keyboard port 0x60 (poll 0x64 until byte available), fill buf. */
+int sys_read(int fd, void *buf, size_t n) {
+    if (fd != 0 || !buf || n == 0) {
+        process_t *p = process_get(current_pid);
+        char pidbuf[12];
+        u32_to_dec(current_pid, pidbuf);
+        fs_ingest_syscall_triple((p && p->name[0]) ? p->name : pidbuf, "read 0 0");
+        return -1;
+    }
+    char *c = (char *)buf;
+    size_t i = 0;
+    while (i < n) {
+        char ch = kbd_read_char_blocking();
+        c[i++] = ch;
+        if (ch == '\n')
+            break;
+    }
+    char obj[24];
+    obj[0] = 'r'; obj[1] = 'e'; obj[2] = 'a'; obj[3] = 'd'; obj[4] = ' ';
+    obj[5] = '0'; obj[6] = ' ';
+    char nb[12];
+    u32_to_dec((uint32_t)i, nb);
+    size_t o = 7;
+    for (size_t k = 0; nb[k] && o < sizeof(obj) - 1; k++) obj[o++] = nb[k];
+    obj[o] = '\0';
+    process_t *p = process_get(current_pid);
+    char pidbuf[12];
+    u32_to_dec(current_pid, pidbuf);
+    fs_ingest_syscall_triple((p && p->name[0]) ? p->name : pidbuf, obj);
+    if (p && p->activation < 1.0f)
+        p->activation += 0.01f;
+    return (int)i;
+}
+
+/* sys_exit: kill current process (remove from list, free slot). Ingest "exit <code>". */
 void sys_exit(int code) {
-    (void)code;
+    char obj[16];
+    obj[0] = 'e'; obj[1] = 'x'; obj[2] = 'i'; obj[3] = 't'; obj[4] = ' ';
+    char cb[12];
+    u32_to_dec((uint32_t)(code & 0xFF), cb);
+    size_t o = 5;
+    for (size_t i = 0; cb[i] && o < sizeof(obj) - 1; i++) obj[o++] = cb[i];
+    obj[o] = '\0';
+    process_t *p = process_get(current_pid);
+    char pidbuf[12];
+    u32_to_dec(current_pid, pidbuf);
+    fs_ingest_syscall_triple((p && p->name[0]) ? p->name : pidbuf, obj);
     uint32_t pid = current_pid;
-    fs_ingest_syscall(pid, "exit", "");
     process_kill(pid);
     if (pid == 1) {
         (void)process_spawn("init", NULL);
         current_pid = 1;
+    } else {
+        current_pid = 0;
+        process_t *list = process_list();
+        if (list)
+            current_pid = list->pid;
     }
 }
 
@@ -840,77 +956,48 @@ uint32_t sys_getpid(void) {
 }
 
 void sys_yield(void) {
-    /* Cooperative yield: just run one cognition cycle (graph-driven reschedule) */
-    cognition_tick_pending = 1;
+    (void)0;
 }
 
-int sys_write(int fd, const void *buf, size_t n) {
-    (void)fd;
-    const char *c = (const char *)buf;
-    if (!c)
-        return 0;
-    for (size_t i = 0; i < n; i++) {
-        char out[2] = { c[i], 0 };
-        monitor_print(out);
-    }
-    fs_ingest_syscall(current_pid, "write", "serial");
-    process_t *p = process_get(current_pid);
-    if (p && p->activation < 1.0f)
-        p->activation += 0.02f;
-    return (int)n;
-}
-
-int sys_read(int fd, void *buf, size_t n) {
-    (void)fd;
-    char *c = (char *)buf;
-    if (!c || n == 0)
-        return 0;
-    size_t i = 0;
-    while (i < n) {
-        char ch = kbd_read_char_blocking();
-        c[i++] = ch;
-        if (ch == '\n')
-            break;
-    }
-    fs_ingest_syscall(current_pid, "read", "kbd");
-    process_t *p = process_get(current_pid);
-    if (p && p->activation < 1.0f)
-        p->activation += 0.01f;
-    return (int)i;
-}
-
+/* sys_open: stub FS — return dummy fd 1 if path exists in triple store, else -1. */
 int sys_open(const char *path, int flags) {
     (void)flags;
     const char *t = fs_lookup(path ? path : "", "type");
-    fs_ingest_syscall(current_pid, "open", path ? path : "");
+    char obj[48];
+    obj[0] = 'o'; obj[1] = 'p'; obj[2] = 'e'; obj[3] = 'n'; obj[4] = ' ';
+    size_t o = 5;
+    if (path)
+        for (size_t i = 0; path[i] && o < sizeof(obj) - 1; i++) obj[o++] = path[i];
+    obj[o] = '\0';
+    process_t *p = process_get(current_pid);
+    char pidbuf[12];
+    u32_to_dec(current_pid, pidbuf);
+    fs_ingest_syscall_triple((p && p->name[0]) ? p->name : pidbuf, obj);
     return t ? 1 : -1;
 }
 
-void sys_close(int fd) {
-    (void)fd;
-    fs_ingest_syscall(current_pid, "close", "");
+/* sys_close: stub — return 0. */
+int sys_close(int fd) {
+    char obj[16];
+    obj[0] = 'c'; obj[1] = 'l'; obj[2] = 'o'; obj[3] = 's'; obj[4] = 'e';
+    obj[5] = ' '; obj[6] = '0' + (fd % 10); obj[7] = '\0';
+    process_t *p = process_get(current_pid);
+    char pidbuf[12];
+    u32_to_dec(current_pid, pidbuf);
+    fs_ingest_syscall_triple((p && p->name[0]) ? p->name : pidbuf, obj);
+    return 0;
 }
 
+/* sys_exec: stub — print "exec stub" to serial only and return. */
 void sys_exec(const char *path) {
-    /* \"Load\" a simple task: spawn a process with name=path and add parent edge via parent ptr */
-    process_t *parent = process_get(current_pid);
-    process_t *child = process_spawn(path ? path : "task", parent);
-    if (child) {
-        child->activation = 0.7f;
-        child->state = PROC_READY;
-        fs_ingest_syscall(child->pid, "exec", path ? path : "");
-        if (parent && parent->activation < 1.0f)
-            parent->activation += 0.03f;
-        monitor_print("spawned ");
-        monitor_print(child->name);
-        monitor_print(" pid=");
-        char b[12];
-        u32_to_dec(child->pid, b);
-        monitor_print(b);
-        monitor_print("\n");
-    } else {
-        monitor_print("spawn failed\n");
-    }
+    (void)path;
+    const char *msg = "exec stub\n";
+    for (size_t i = 0; msg[i]; i++)
+        serial_putc_blocking(msg[i]);
+    process_t *p = process_get(current_pid);
+    char pidbuf[12];
+    u32_to_dec(current_pid, pidbuf);
+    fs_ingest_syscall_triple((p && p->name[0]) ? p->name : pidbuf, "exec stub");
 }
 
 /* ----- Kernel entry (called from boot.asm with magic, multiboot info) ----- */
@@ -934,20 +1021,16 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
     idt_init();
     pic_init();
     pit_init();
-    cognition_tick_pending = 0;
     ticks = 0;
 
-    int preset = BTFOS_BOOT_PRESET;
-    cognition_loop(preset);   /* one initial run before "Ready" */
+    /* Cognition runs from PIT timer only (timer_irq_handler), not from main loop. */
+    s_cognition_preset = BTFOS_BOOT_PRESET;
+    cognition_loop(s_cognition_preset);   /* one initial run before "Ready" */
 
     monitor_print("BTFOS Ready\n> ");
 
     __asm__ volatile ("sti");
     for (;;) {
-        if (cognition_tick_pending) {
-            cognition_tick_pending = 0;
-            cognition_loop(preset);   /* run cognition per timer tick; updates process priorities/states from graph */
-        }
         shell_run();
         __asm__ volatile ("hlt");
     }

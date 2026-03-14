@@ -6,6 +6,28 @@ Format: **[Update N]** – short title, then detailed list.
 
 ---
 
+## [Update 7] – PIT 100 Hz, real syscalls (serial/kbd), cognition from timer only, echo/read
+
+**Date:** 2025-03
+
+- **PIT timer (IRQ0, 0x40/0x43)**
+  - Programmed for 100 Hz (divisor 11932); IDT entry 32 invokes handler that calls `cognition_loop()` each tick.
+- **Syscalls (minimal real implementations)**
+  - `sys_write(1, buf, n)`: writes to serial 0x3F8 (wait THRE per byte).
+  - `sys_read(0, buf, n)`: reads from keyboard port 0x60 (poll 0x64 until byte available).
+  - `sys_exit(code)`: kills current process, respawns init if PID 1.
+  - `sys_open`/`sys_close`: stub (dummy fd / return 0).
+  - `sys_exec`: stub — prints "exec stub" to serial and returns.
+- **Syscall triples**
+  - Every syscall ingests triple: subj = process name or pid, pred = "syscall", obj = name + args (e.g. "write 1 6", "read 0 3").
+- **Cognition from timer only**
+  - Main loop no longer calls `cognition_loop`; only the PIT handler does.
+- **Shell**
+  - `echo <text>` → `sys_write(1, "text\n", len)`.
+  - `read` → `sys_read(0, buf, 10)`, then print result. Help updated.
+
+---
+
 ## [Update 6] – PIT ~100ms, syscall triple format (subj=pid, pred=syscall), shell run exec
 
 **Date:** 2025-03
