@@ -1,0 +1,10 @@
+# Build
+*.o
+*.elf
+btfos.elf
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
