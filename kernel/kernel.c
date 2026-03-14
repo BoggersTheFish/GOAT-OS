@@ -160,8 +160,8 @@ static void pic_init(void) {
     outb(0xA1, 0xFF);
 }
 
-/* PIT channel 0: ~100 Hz (divisor 11932) for cognition tick */
-#define PIT_DIVISOR 11932
+/* PIT channel 0: ~10 Hz (~100ms) cognition tick */
+#define PIT_DIVISOR 119318
 static void pit_init(void) {
     outb(0x43, 0x36);
     outb(0x40, (uint8_t)(PIT_DIVISOR & 0xFF));
@@ -537,23 +537,32 @@ static void fs_write_cstr(char *dst, size_t cap, const char *src) {
     dst[i] = '\0';
 }
 
-/* Ingest syscall as a triple into FS: subj=proc:<pid>, pred, obj */
-static void fs_ingest_syscall(uint32_t pid, const char *pred, const char *obj) {
+/* Ingest syscall as a triple into FS:
+   subj=<pid> (decimal), pred=\"syscall\", obj=\"<name> <detail>\" (best-effort). */
+static void fs_ingest_syscall(uint32_t pid, const char *name, const char *detail) {
     triple_t *t = fs_alloc_triple();
     if (!t)
         return;
     char pidbuf[12];
     u32_to_dec(pid, pidbuf);
 
-    /* subj = "proc:" + pid */
-    size_t o = 0;
-    const char *prefix = "proc:";
-    for (size_t i = 0; i < 31 && prefix[i]; i++) t->subj[o++] = prefix[i];
-    for (size_t i = 0; i < 31 && pidbuf[i] && o < 31; i++) t->subj[o++] = pidbuf[i];
-    t->subj[o] = '\0';
+    /* subj = pid */
+    fs_write_cstr(t->subj, sizeof(t->subj), pidbuf);
+    fs_write_cstr(t->pred, sizeof(t->pred), "syscall");
 
-    fs_write_cstr(t->pred, sizeof(t->pred), pred ? pred : "syscall");
-    fs_write_cstr(t->obj, sizeof(t->obj), obj ? obj : "");
+    /* obj = \"<name> <detail>\" */
+    mem_zero(t->obj, sizeof(t->obj));
+    size_t o = 0;
+    if (name) {
+        for (size_t i = 0; i + 1 < sizeof(t->obj) && name[i]; i++)
+            t->obj[o++] = name[i];
+    }
+    if (detail && detail[0] && o + 1 < sizeof(t->obj)) {
+        t->obj[o++] = ' ';
+        for (size_t i = 0; i + 1 < sizeof(t->obj) - o && detail[i]; i++)
+            t->obj[o++] = detail[i];
+    }
+    t->obj[o < sizeof(t->obj) ? o : (sizeof(t->obj) - 1)] = '\0';
     fs_insert_triple(t);
 }
 
@@ -745,6 +754,11 @@ void shell_run(void) {
         return;
     }
     if (shell_line[0] == 'r' && shell_line[1] == 'u' && shell_line[2] == 'n' && shell_line[3] == ' ') {
+        /* Accept both: \"run <task>\" and \"run exec <task>\" */
+        if (shell_line[4] == 'e' && shell_line[5] == 'x' && shell_line[6] == 'e' && shell_line[7] == 'c' && shell_line[8] == ' ') {
+            sys_exec(&shell_line[9]);
+            return;
+        }
         sys_exec(&shell_line[4]);
         return;
     }

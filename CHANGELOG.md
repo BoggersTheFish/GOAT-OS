@@ -6,6 +6,19 @@ Format: **[Update N]** – short title, then detailed list.
 
 ---
 
+## [Update 6] – PIT ~100ms, syscall triple format (subj=pid, pred=syscall), shell run exec
+
+**Date:** 2025-03
+
+- **PIT timer**
+  - Cognition tick interval changed from ~100 Hz to ~10 Hz (~100ms) via PIT divisor 119318 (ports 0x40/0x43).
+- **Syscall ingestion**
+  - Triples now use subj=pid (decimal), pred="syscall", obj="&lt;name&gt; &lt;detail&gt;" (e.g. "write serial", "exec /path").
+- **Shell**
+  - Added support for "run exec &lt;task&gt;" in addition to "run &lt;task&gt;" (both call sys_exec).
+
+---
+
 ## [Update 5] – Basic syscalls, keyboard input, syscall graph ingestion, interactive shell
 
 **Date:** 2025-03
