@@ -9,7 +9,7 @@ CFLAGS = -m32 -ffreestanding -fno-stack-protector -fno-pie -Wall -Wextra -I incl
 ASMFLAGS = -f elf32
 LDFLAGS = -m elf_i386 -T kernel/linker.ld -nostdlib
 
-KERNEL_OBJ = boot/boot.o kernel/kernel.o
+KERNEL_OBJ = boot/boot.o boot/timer_isr.o kernel/kernel.o
 TARGET     = btfos.elf
 
 .PHONY: all clean run
@@ -22,11 +22,14 @@ $(TARGET): $(KERNEL_OBJ)
 boot/boot.o: boot/boot.asm
 	$(ASM) $(ASMFLAGS) -o $@ $<
 
+boot/timer_isr.o: boot/timer_isr.asm
+	$(ASM) $(ASMFLAGS) -o $@ $<
+
 kernel/kernel.o: kernel/kernel.c include/btfos_config.h
 	$(CC) $(CFLAGS) -c -o $@ kernel/kernel.c
 
 clean:
-	rm -f $(KERNEL_OBJ) $(TARGET)
+	rm -f boot/boot.o boot/timer_isr.o kernel/kernel.o $(TARGET)
 
 # Run in QEMU (install qemu-system-x86)
 run: $(TARGET)

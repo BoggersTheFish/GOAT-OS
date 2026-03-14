@@ -73,6 +73,74 @@ static void monitor_print(const char *s) {
 /* ----- Memory (stub) ----- */
 void memory_init(void) { (void)0; }
 
+/* ----- Timer interrupt: periodic cognition tick ----- */
+static volatile uint32_t cognition_tick_pending;
+
+/* Called from asm irq0_entry (IRQ0 = PIT) */
+void timer_irq_handler(void) {
+    cognition_tick_pending = 1;
+    outb(0x20, 0x20);   /* PIC1 EOI */
+}
+
+/* IDT: 256 entries, 8 bytes each. Gate = offset_lo, selector, zero, type, offset_hi */
+#define IDT_ENTRIES 256
+typedef struct {
+    uint16_t offset_lo;
+    uint16_t selector;
+    uint8_t  zero;
+    uint8_t  type;
+    uint16_t offset_hi;
+} __attribute__((packed)) idt_entry_t;
+
+static idt_entry_t idt[IDT_ENTRIES];
+static struct {
+    uint16_t limit;
+    uint32_t base;
+} __attribute__((packed)) idt_ptr;
+
+extern void irq0_entry(void);
+
+static void idt_set_gate(unsigned int i, uint32_t offset, uint16_t sel, uint8_t typ) {
+    if (i >= IDT_ENTRIES) return;
+    idt[i].offset_lo = (uint16_t)(offset & 0xFFFF);
+    idt[i].offset_hi = (uint16_t)((offset >> 16) & 0xFFFF);
+    idt[i].selector  = sel;
+    idt[i].zero     = 0;
+    idt[i].type     = typ;
+}
+
+static void idt_init(void) {
+    uint32_t i;
+    for (i = 0; i < IDT_ENTRIES; i++)
+        idt_set_gate(i, 0, 0x08, 0);
+    idt_set_gate(32, (uint32_t)irq0_entry, 0x08, 0x8E);  /* IRQ0: present, ring0, 32-bit interrupt gate */
+    idt_ptr.limit = (uint16_t)(sizeof(idt) - 1);
+    idt_ptr.base  = (uint32_t)&idt[0];
+    __asm__ volatile ("lidt %0" : : "m"(idt_ptr));
+}
+
+/* PIC: remap to 0x20-0x2F, mask all but IRQ0 */
+static void pic_init(void) {
+    outb(0x20, 0x11);
+    outb(0xA0, 0x11);
+    outb(0x21, 0x20);
+    outb(0xA1, 0x28);
+    outb(0x21, 0x04);
+    outb(0xA1, 0x02);
+    outb(0x21, 0x01);
+    outb(0xA1, 0x01);
+    outb(0x21, 0xFE);   /* mask: allow IRQ0 only */
+    outb(0xA1, 0xFF);
+}
+
+/* PIT channel 0: ~100 Hz (divisor 11932) for cognition tick */
+#define PIT_DIVISOR 11932
+static void pit_init(void) {
+    outb(0x43, 0x36);
+    outb(0x40, (uint8_t)(PIT_DIVISOR & 0xFF));
+    outb(0x40, (uint8_t)((PIT_DIVISOR >> 8) & 0xFF));
+}
+
 /* ----- Graph (GOAT-TS): nodes = pid, activation, state, mass, position; edges = relations (from/to/weight). create/destroy/add_node/add_edge, spread_activation, decay_states, apply_forces, curiosity, reflection, goal_generator, sandbox_test, get_activation, get_state. ----- */
 typedef struct graph_node_inner {
     uint32_t pid;
@@ -280,7 +348,7 @@ void process_init(void) {
         process_pool[i].pid = 0;
 }
 
-/* Stub: return list of processes (single bootstrap process if empty) */
+/* Return real process list: all entries in process_pool with pid != 0, linked by .next (ingest for graph) */
 process_t *process_list(void) {
     if (process_count == 0) {
         process_pool[0].pid = 1;
@@ -293,7 +361,21 @@ process_t *process_list(void) {
         process_pool[0].next = NULL;
         process_count = 1;
     }
-    return &process_pool[0];
+    /* Build linked list from pool (all active processes) */
+    process_t *head = NULL;
+    process_t *tail = NULL;
+    unsigned int i;
+    for (i = 0; i < BTFOS_MAX_PROCESSES; i++) {
+        if (process_pool[i].pid == 0)
+            continue;
+        process_pool[i].next = NULL;
+        if (tail)
+            tail->next = &process_pool[i];
+        else
+            head = &process_pool[i];
+        tail = &process_pool[i];
+    }
+    return head;
 }
 
 /* ----- FS (triples) ----- */
@@ -489,7 +571,7 @@ void cognition_loop(int preset) {
         graph_sandbox_test(g);
     }
 
-    /* Write back: update process activation/state from graph */
+    /* Write back: update process priorities (activation) and states from graph */
     for (process_t *p = processes; p; p = p->next) {
         p->activation = graph_get_activation(g, p->pid);
         p->state = graph_get_state(g, p->pid);
@@ -555,13 +637,24 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
     fs_init();
     shell_init();
 
+    /* Timer interrupt hook: IDT + PIC + PIT so cognition runs per tick */
+    idt_init();
+    pic_init();
+    pit_init();
+    cognition_tick_pending = 0;
+
     int preset = BTFOS_BOOT_PRESET;
-    cognition_loop(preset);
+    cognition_loop(preset);   /* one initial run before "Ready" */
 
     monitor_print("BTFOS Ready\n> ");
 
+    __asm__ volatile ("sti");
     for (;;) {
+        if (cognition_tick_pending) {
+            cognition_tick_pending = 0;
+            cognition_loop(preset);   /* run cognition per timer tick; updates process priorities/states from graph */
+        }
         shell_run();
-        cognition_loop(preset);
+        __asm__ volatile ("hlt");
     }
 }

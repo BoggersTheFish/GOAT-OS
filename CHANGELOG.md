@@ -6,6 +6,22 @@ Format: **[Update N]** – short title, then detailed list.
 
 ---
 
+## [Update 4] – Timer interrupt, cognition per tick, real process_list
+
+**Date:** 2025-03
+
+- **Timer interrupt hook**
+  - IDT (256 entries), vector 32 set to timer IRQ stub. PIC remapped to 0x20–0x2F; only IRQ0 unmasked. PIT channel 0 at ~100 Hz (divisor 11932). `boot/timer_isr.asm`: `irq0_entry` saves state, calls C `timer_irq_handler`, EOI, IRET.
+  - `timer_irq_handler()` sets `cognition_tick_pending`; main loop runs `cognition_loop(preset)` each tick and updates process priorities/states from graph.
+- **Main loop**
+  - After `sti`, loop: if `cognition_tick_pending` then clear and run `cognition_loop(preset)`; then `shell_run()`; then `hlt`. Cognition runs periodically from timer, not in a tight loop.
+- **Real process_list()**
+  - Builds linked list of all active processes in `process_pool` (pid != 0), linked by `.next`; returned list is ingested into graph each cognition tick.
+- **Build**
+  - `boot/timer_isr.o` added to Makefile; `timer_isr.asm` assembled and linked.
+
+---
+
 ## [Update 3] – Graph struct (nodes/edges), cognition loop integration
 
 **Date:** 2025-03
