@@ -12,7 +12,7 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 |-----------|--------|
 | **Strongest Node** | Robust TS-OS (activation 100, tension 8) |
 | **Paging** | 4-level, identity map kernel, user 0–2 MiB (U=1) |
-| **Heap** | Linked-list with coalescing + defrag (frag > 30%) |
+| **Heap** | Linked-list with coalescing + defrag (frag > 25%) |
 | **Keyboard** | Shift, caps lock, 128-byte circular buffer |
 | **Persistence** | Checkpoint graph+fs every 30s, restore on boot |
 | **Process graph** | Vec-based, up to 32 nodes, dynamic emergence |
@@ -38,7 +38,7 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 ### Core
 - **Boot with Limine** – x86_64 bare-metal (BIOS + UEFI)
 - **4-level paging** – Identity map kernel, user 0–2 MiB (U=1), per-process page dirs
-- **Linked-list heap** – 128 KiB, coalescing on free, defrag when frag > 30%
+- **Linked-list heap** – 128 KiB, coalescing on free, defrag when frag > 25%
 - **GDT + TSS** – Kernel + user segments, TSS for kernel stack
 - **Ring 3 user mode** – User CS/SS, iretq, syscall DPL=3
 
@@ -122,7 +122,7 @@ BoggersTheOS/
 - **Persistence** – In-RAM only; lost on power cycle
 - **No disk** – No persistent storage
 - **Keyboard** – US QWERTY scancode set 1 only
-- **No coalescing** – Defrag merges adjacent free blocks only; no moving allocated blocks
+- **Defrag** – Merges adjacent free blocks only; no moving of allocated blocks
 - **Process isolation** – Per-process address space; kernel still shared
 - **Shell** – Minimal
 

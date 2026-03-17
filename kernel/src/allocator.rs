@@ -154,7 +154,7 @@ pub struct LinkedListAllocator;
 
 unsafe impl GlobalAlloc for LinkedListAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if fragmentation_ratio() > 0.30 {
+        if fragmentation_ratio() > 0.25 {
             defrag_pass();
         }
         let align = layout.align().max(8).min(16);
