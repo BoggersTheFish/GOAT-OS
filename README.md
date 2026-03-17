@@ -10,7 +10,7 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 
 | Component | Status |
 |-----------|--------|
-| **Strongest Node** | PIT timer + preemptive scheduler (activation 100, tension 0) |
+| **Strongest Node** | Bump heap allocator (activation 100, tension 0) |
 | **Secondary nodes** | 5 process nodes in static graph |
 
 ### Node Table
@@ -23,19 +23,20 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 | 3 | 3 | 40 | 20 | 2, 0 |
 | 4 | 4 | 80 | 0 | 0 |
 
-**Tensions resolved:** No timer interrupt / real preemption  
-**Tensions remaining:** No user mode, no dynamic process creation, no heap, no filesystem, serial-only, no shell  
-**Coherence delta:** +1 (PIT replaces busy-wait)
+**Tensions resolved:** No heap allocator  
+**Tensions remaining:** No user mode, no dynamic process creation, no filesystem, serial-only, no shell  
+**Coherence delta:** +1 (64 KiB bump heap, enables future dynamic allocation)
 
 ---
 
 ## Implemented Features
 
 - **Boot with Limine** – x86_64 bare-metal boot via Limine bootloader (BIOS + UEFI)
+- **Bump heap allocator** – 64 KiB static backing, GlobalAlloc, atomic bump pointer, no free
 - **PIT timer interrupt** – Real ~10ms tick (11932 divisor), PIC remapped, IRQ0 → vector 32
 - **Preemptive scheduler** – Timer fires, saves full context, runs decay/spread/select, switches via iretq
 - **GDT + IDT** – x86_64 crate for GDT (code/data segments), IDT with assembly stub for timer
-- **Static ProcessGraph** – In-RAM process graph with `[ProcessNode; 8]`, no heap
+- **Static ProcessGraph** – In-RAM process graph with `[ProcessNode; 8]`
 - **Per-node 4 KiB stacks** – Each node has `stack: [u8; 4096]`, `saved_rip`, `saved_rsp`
 - **Real context switch** – Assembly stub saves GPRs, timer_handler returns new frame ptr, iretq restores
 - **`yield_to_kernel()`** – Node entries call this to save context and return to scheduler
@@ -144,9 +145,15 @@ BoggersTheOS/
 After push, the next Strongest Node candidates:
 
 1. **User-mode ring** – Ring 3 execution for node entries (requires TSS, ring transition)
-2. **Heap allocator** – Simple bump or buddy for dynamic memory
+2. **Dynamic process emergence** – Spawn new nodes at runtime using heap
 3. **In-RAM file system** – Hierarchical node graph as files (no disk, pure RAM)
 4. **Process emergence from workload** – Triple extraction: spawn nodes from detected patterns
+
+---
+
+## Current Limitations
+
+This is still a minimal research kernel, not a complete usable OS. No user mode, no shell, no filesystem, no keyboard/VGA. Serial-only output. Process graph is fixed at boot. The heap is bump-only (no free). Architecture emerges node-by-node per .cursorrules.
 
 ---
 
