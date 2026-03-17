@@ -6,19 +6,27 @@ $(call USER_VARIABLE,KARCH,x86_64)
 $(call USER_VARIABLE,QEMUFLAGS,-m 2G -serial stdio)
 
 override IMAGE_NAME := ts-os-$(KARCH)
+DISK_IMG := disk.img
 
 .PHONY: all
 all: $(IMAGE_NAME).iso
 
+$(DISK_IMG):
+	@dd if=/dev/zero of=$(DISK_IMG) bs=1M count=16 2>/dev/null || \
+	fsutil file createnew $(DISK_IMG) 16777216 2>nul || \
+	(echo "Create disk.img: fsutil file createnew disk.img 16777216" && exit 1)
+
 .PHONY: run
-run: $(IMAGE_NAME).iso
-	qemu-system-$(KARCH) -M q35 -cdrom $(IMAGE_NAME).iso -boot d $(QEMUFLAGS)
+run: $(IMAGE_NAME).iso $(DISK_IMG)
+	qemu-system-$(KARCH) -M q35 -cdrom $(IMAGE_NAME).iso -boot d \
+		-drive file=$(DISK_IMG),format=raw,if=ide $(QEMUFLAGS)
 
 .PHONY: run-uefi
-run-uefi: edk2-ovmf $(IMAGE_NAME).iso
+run-uefi: edk2-ovmf $(IMAGE_NAME).iso $(DISK_IMG)
 	qemu-system-$(KARCH) -M q35 \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(KARCH).fd,readonly=on \
-		-cdrom $(IMAGE_NAME).iso $(QEMUFLAGS)
+		-cdrom $(IMAGE_NAME).iso \
+		-drive file=$(DISK_IMG),format=raw,if=ide $(QEMUFLAGS)
 
 edk2-ovmf:
 	curl -L https://github.com/osdev0/edk2-ovmf-nightly/releases/latest/download/edk2-ovmf.tar.gz | gunzip | tar -xf -

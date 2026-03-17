@@ -109,6 +109,65 @@ fn add_child(parent: usize, idx: usize) -> bool {
     }
 }
 
+fn remove_child(parent: usize, idx: usize) -> bool {
+    unsafe {
+        for i in 0..MAX_CHILDREN {
+            if NODES[parent].children[i] == idx {
+                for j in i..MAX_CHILDREN - 1 {
+                    NODES[parent].children[j] = NODES[parent].children[j + 1];
+                }
+                NODES[parent].children[MAX_CHILDREN - 1] = usize::MAX;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn child_count(idx: usize) -> usize {
+    unsafe {
+        let mut n = 0;
+        for i in 0..MAX_CHILDREN {
+            if NODES[idx].children[i] == usize::MAX {
+                break;
+            }
+            n += 1;
+        }
+        n
+    }
+}
+
+/// Remove file or empty directory. Returns false if path doesn't exist, is non-empty dir, or is root.
+pub fn rm(path: &str) -> bool {
+    unsafe {
+        let parts: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return false;
+        }
+        let name = parts[parts.len() - 1];
+        let parent_path = if parts.len() == 1 {
+            "/"
+        } else {
+            &("/".to_string() + &parts[..parts.len() - 1].join("/"))
+        };
+        let parent = match resolve(parent_path) {
+            Some(p) => p,
+            None => return false,
+        };
+        let idx = match find_child(parent, name) {
+            Some(i) => i,
+            None => return false,
+        };
+        if matches!(NODES[idx].kind, FsNodeKind::Dir) {
+            if child_count(idx) > 0 {
+                return false;
+            }
+        }
+        NODES[idx].kind = FsNodeKind::None;
+        remove_child(parent, idx)
+    }
+}
+
 pub fn mkdir(path: &str) -> bool {
     unsafe {
         let parts: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
@@ -214,6 +273,17 @@ fn resolve(path: &str) -> Option<usize> {
         cur = find_child(cur, part)?;
     }
     Some(cur)
+}
+
+/// Returns true if path exists and is a directory.
+pub fn path_is_dir(path: &str) -> bool {
+    unsafe {
+        if let Some(idx) = resolve(path) {
+            matches!(NODES[idx].kind, FsNodeKind::Dir)
+        } else {
+            false
+        }
+    }
 }
 
 pub fn list_dir(path: &str) -> Vec<String> {

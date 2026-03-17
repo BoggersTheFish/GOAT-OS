@@ -9,6 +9,11 @@ const BUF_SIZE: usize = 128;
 const SC_LSHIFT: u8 = 0x2A;
 const SC_RSHIFT: u8 = 0x36;
 const SC_CAPSLOCK: u8 = 0x3A;
+const SC_BACKSPACE: u8 = 0x0E;
+const SC_UP: u8 = 0x48;
+const SC_DOWN: u8 = 0x50;
+const SC_LEFT: u8 = 0x4B;
+const SC_RIGHT: u8 = 0x4D;
 
 static mut SHIFT: bool = false;
 static mut CAPS: bool = false;
@@ -27,13 +32,13 @@ unsafe fn inb(port: u16) -> u8 {
 
 fn scancode_to_ascii(sc: u8, shifted: bool) -> Option<u8> {
     const LOWER: [u8; 58] = [
-        0, 0, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', 0, 0,
+        0, 0, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', 0x08, 0,
         b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', b'[', b']', b'\n', 0,
         b'a', b's', b'd', b'f', b'g', b'h', b'j', b'k', b'l', b';', b'\'', b'`', 0, b'\\',
         b'z', b'x', b'c', b'v', b'b', b'n', b'm', b',', b'.', b'/', 0, b'*', 0, b' ',
     ];
     const UPPER: [u8; 58] = [
-        0, 0, b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'_', b'+', 0, 0,
+        0, 0, b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'_', b'+', 0x08, 0,
         b'Q', b'W', b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P', b'{', b'}', b'\n', 0,
         b'A', b'S', b'D', b'F', b'G', b'H', b'J', b'K', b'L', b':', b'"', b'~', 0, b'|',
         b'Z', b'X', b'C', b'V', b'B', b'N', b'M', b'<', b'>', b'?', 0, b'*', 0, b' ',
@@ -79,6 +84,30 @@ pub fn poll() -> Option<u8> {
             }
             SC_CAPSLOCK => {
                 CAPS = !CAPS;
+                return None;
+            }
+            SC_UP => {
+                push_byte(0x1B);
+                push_byte(b'[');
+                push_byte(b'A');
+                return None;
+            }
+            SC_DOWN => {
+                push_byte(0x1B);
+                push_byte(b'[');
+                push_byte(b'B');
+                return None;
+            }
+            SC_LEFT => {
+                push_byte(0x1B);
+                push_byte(b'[');
+                push_byte(b'D');
+                return None;
+            }
+            SC_RIGHT => {
+                push_byte(0x1B);
+                push_byte(b'[');
+                push_byte(b'C');
                 return None;
             }
             _ => {}

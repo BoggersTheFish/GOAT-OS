@@ -1,5 +1,41 @@
 # Changelog
 
+## 2025-03-17 – Phases 2–6: Full Roadmap Implementation
+
+### Summary
+Implemented Phases 2–6 of the TS-OS Full Development Roadmap: memory protection (paging), persistent storage (disk), usable shell (cd, pwd, rm, pipes, redirection, history), multi-process (getpid, chdir, getcwd, wait, kill), and ecosystem (wc, head, tail, help &lt;cmd&gt;).
+
+### Phase 2: Memory Protection
+- **4-level paging** – Per-process page tables, CR3 switch on schedule
+- **Syscall validation** – Bounds-check user pointers for all syscalls
+- **ProcessNode** – Added cr3 field, page table creation on spawn
+
+### Phase 3: Persistent Storage
+- **IDE PIO driver** – disk.rs, read_sector/write_sector (primary master 0x1F0)
+- **Checkpoint to disk** – persist.rs writes to sector 0, restore from disk on boot
+- **disk.img** – 16 MB, created by make run
+
+### Phase 4: Usable Shell
+- **cd, pwd** – Working directory with resolve_path
+- **rm** – Remove file or empty directory (fs::rm, SYS_RM)
+- **Pipes** – cmd1 | cmd2 (e.g. ls | cat out.txt)
+- **Redirection** – cmd > file, cmd < file
+- **History** – Up/down arrows, 16 entries
+- **Line editor** – Backspace, arrow keys (ANSI escape sequences)
+- **Keyboard** – Arrow scancodes, backspace
+
+### Phase 5: Multi-Process
+- **getpid, chdir, getcwd** – Per-process cwd in ProcessNode
+- **wait** – Block until child exits, return pid and status
+- **kill** – SYS_KILL(pid, 9) for SIGKILL
+- **Parent-child** – ProcessNode.parent, exit_status, NodeState::Waiting
+
+### Phase 6: Ecosystem
+- **wc, head, tail** – Minimal text utilities
+- **help &lt;cmd&gt;** – Per-command help
+
+---
+
 ## 2025-03-17 – Phase 1: Stability Foundation (Partial)
 
 ### Summary

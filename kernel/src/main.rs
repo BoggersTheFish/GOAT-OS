@@ -12,8 +12,10 @@
 extern crate alloc;
 
 mod allocator;
+mod disk;
 mod fs;
 mod keyboard;
+mod paging;
 mod persist;
 mod shell;
 mod vga;
@@ -51,6 +53,7 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 const COM1: u16 = 0x3F8;
 const LCR: u16 = COM1 + 3;
+const LSR: u16 = COM1 + 5;
 const DLL: u16 = COM1 + 0;
 const DLM: u16 = COM1 + 1;
 const FCR: u16 = COM1 + 2;
@@ -73,6 +76,8 @@ const KERNEL_STACK_SIZE: usize = 4096;
 static mut KERNEL_RSP: u64 = 0;
 static mut CURRENT_NODE_IDX: usize = 0xFF;
 static mut TICK_COUNT: u32 = 0;
+static mut HHDM_OFFSET: u64 = 0;
+static mut KERNEL_CR3: u64 = 0;
 
 core::arch::global_asm!(
     r#"
@@ -184,6 +189,26 @@ unsafe fn outb(port: u16, byte: u8) {
     asm!("out dx, al", in("dx") port, in("al") byte, options(nostack, preserves_flags));
 }
 
+#[inline(always)]
+unsafe fn inb(port: u16) -> u8 {
+    let ret: u8;
+    asm!("in al, dx", in("dx") port, out("al") ret, options(nostack, preserves_flags));
+    ret
+}
+
+fn serial_read_byte() -> Option<u8> {
+    unsafe {
+        if (inb(LSR) & 1) == 0 {
+            return None;
+        }
+        Some(inb(COM1))
+    }
+}
+
+fn serial_has_byte() -> bool {
+    unsafe { (inb(LSR) & 1) != 0 }
+}
+
 fn serial_init() {
     unsafe {
         outb(LCR, 0x80);
@@ -240,12 +265,16 @@ fn serial_write_hex(n: u64) {
     }
 }
 
+const CWD_MAX: usize = 64;
+const PARENT_NONE: usize = 0xFF;
+
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum NodeState {
     Ready = 0,
     Running = 1,
     Exited = 2,
+    Waiting = 3,
 }
 
 struct ProcessNode {
@@ -257,6 +286,10 @@ struct ProcessNode {
     stack: [u8; STACK_SIZE],
     saved_rip: u64,
     saved_rsp: u64,
+    cr3: u64,
+    parent: usize,
+    exit_status: u8,
+    cwd: [u8; CWD_MAX],
 }
 
 impl ProcessNode {
@@ -270,6 +303,10 @@ impl ProcessNode {
             stack: [0u8; STACK_SIZE],
             saved_rip: 0,
             saved_rsp: 0,
+            cr3: 0,
+            parent: PARENT_NONE,
+            exit_status: 0,
+            cwd: [0; CWD_MAX],
         }
     }
 
@@ -293,10 +330,13 @@ impl ProcessGraph {
         self.nodes.len()
     }
 
-    fn add_node(&mut self, id: u32, activation: u32, tension: u32, neighbors: &[u8]) -> bool {
+    fn add_node(&mut self, id: u32, activation: u32, tension: u32, neighbors: &[u8], parent: usize) -> bool {
         if self.nodes.len() >= MAX_NODES {
             return false;
         }
+        let mut cwd = [0u8; CWD_MAX];
+        cwd[0] = b'/';
+        cwd[1] = 0;
         self.nodes.push(ProcessNode {
             id,
             activation,
@@ -312,6 +352,10 @@ impl ProcessGraph {
             stack: [0u8; STACK_SIZE],
             saved_rip: 0,
             saved_rsp: 0,
+            cr3: 0,
+            parent,
+            exit_status: 0,
+            cwd,
         });
         true
     }
@@ -348,7 +392,7 @@ impl ProcessGraph {
         let mut best = None;
         let mut best_s = i32::MIN;
         for i in 0..self.nodes.len() {
-            if matches!(self.nodes[i].state, NodeState::Exited) {
+            if matches!(self.nodes[i].state, NodeState::Exited | NodeState::Waiting) {
                 continue;
             }
             let s = self.nodes[i].effective_strength();
@@ -360,12 +404,12 @@ impl ProcessGraph {
         best
     }
 
-    fn try_add_node(&mut self, id: u32, activation: u32, tension: u32, neighbors: &[u8]) -> Option<usize> {
+    fn try_add_node(&mut self, id: u32, activation: u32, tension: u32, neighbors: &[u8], parent: usize) -> Option<usize> {
         if self.nodes.len() >= MAX_NODES {
             return None;
         }
         let i = self.nodes.len();
-        self.add_node(id, activation, tension, neighbors);
+        self.add_node(id, activation, tension, neighbors, parent);
         Some(i)
     }
 }
@@ -494,6 +538,12 @@ const SYS_WRITE_F: u64 = 11;
 const SYS_SHUTDOWN: u64 = 12;
 const SYS_CLEAR: u64 = 13;
 const SYS_POLL_KEY: u64 = 14;
+const SYS_RM: u64 = 15;
+const SYS_GETPID: u64 = 16;
+const SYS_CHDIR: u64 = 17;
+const SYS_GETCWD: u64 = 18;
+const SYS_WAIT: u64 = 19;
+const SYS_KILL: u64 = 20;
 
 fn do_checkpoint() {
     let mut graph_buf = [0u8; 64];
@@ -512,11 +562,25 @@ fn maybe_emerge_node() {
     }
     if max_tension > 30 && graph().count() < MAX_NODES {
         let next_id = graph().count() as u32;
-        if let Some(idx) = graph().try_add_node(next_id, 50, 0, &[]) {
+        let parent = unsafe {
+            if CURRENT_NODE_IDX != 0xFF {
+                CURRENT_NODE_IDX
+            } else {
+                PARENT_NONE
+            }
+        };
+        if let Some(idx) = graph().try_add_node(next_id, 50, 0, &[], parent) {
             init_node_stacks_for(&mut graph().nodes[idx]);
             graph().nodes[idx].state = NodeState::Ready;
         }
     }
+}
+
+fn validate_buf(ptr: *const u8, len: usize) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+    ptr as usize <= usize::MAX - len
 }
 
 fn do_schedule(cur: Option<usize>) -> u64 {
@@ -531,12 +595,17 @@ fn do_schedule(cur: Option<usize>) -> u64 {
         graph().nodes[ns].state = NodeState::Running;
         let do_switch = cur != Some(ns) || cur.is_none();
         if do_switch {
-            unsafe { CURRENT_NODE_IDX = ns };
+            unsafe {
+                CURRENT_NODE_IDX = ns;
+                paging::switch_cr3(graph().nodes[ns].cr3);
+            }
             if graph().nodes[ns].saved_rsp != 0 {
                 return graph().nodes[ns].saved_rsp;
             }
             return unsafe { graph().nodes[ns].stack.as_ptr().add(STACK_SIZE - 160) as u64 };
         }
+    } else {
+        unsafe { paging::switch_cr3(KERNEL_CR3) };
     }
     0
 }
@@ -550,6 +619,10 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             let _fd = *frame.add(5);
             let buf = *frame.add(4) as *const u8;
             let len = *frame.add(3) as usize;
+            if !validate_buf(buf, len) {
+                *(frame_ptr as *mut u64) = !0u64;
+                return 0;
+            }
             for i in 0..len {
                 let b = *buf.add(i);
                 outb(COM1, b);
@@ -563,9 +636,9 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             let buf = *frame.add(4) as *mut u8;
             let len = *frame.add(3) as usize;
             let mut n = 0usize;
-            if fd == 0 && len > 0 {
-                if let Some(c) = keyboard::read_byte() {
-                    *buf.add(0) = c;
+            if fd == 0 && len > 0 && validate_buf(buf, len) {
+                if let Some(c) = keyboard::read_byte().or_else(serial_read_byte) {
+                    unsafe { *buf.add(0) = c };
                     n = 1;
                 }
             }
@@ -586,7 +659,12 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
         SYS_SPAWN => {
             let next_id = graph().count() as u32;
             let frame_mut = frame_ptr as *mut u64;
-            if let Some(idx) = graph().try_add_node(next_id, 50, 0, &[]) {
+            let parent = if CURRENT_NODE_IDX != 0xFF {
+                CURRENT_NODE_IDX
+            } else {
+                PARENT_NONE
+            };
+            if let Some(idx) = graph().try_add_node(next_id, 50, 0, &[], parent) {
                 init_node_stacks_for(&mut graph().nodes[idx]);
                 graph().nodes[idx].state = NodeState::Ready;
                 *frame_mut.add(0) = idx as u64;
@@ -596,10 +674,24 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             0
         }
         SYS_EXIT => {
-            let _status = *frame.add(5);
+            let status = *frame.add(5) as u8;
             if CURRENT_NODE_IDX != 0xFF {
-                graph().nodes[CURRENT_NODE_IDX].state = NodeState::Exited;
-                graph().nodes[CURRENT_NODE_IDX].saved_rsp = frame_ptr as u64;
+                let idx = CURRENT_NODE_IDX;
+                graph().nodes[idx].state = NodeState::Exited;
+                graph().nodes[idx].exit_status = status;
+                graph().nodes[idx].saved_rsp = frame_ptr as u64;
+                let parent = graph().nodes[idx].parent;
+                if parent != PARENT_NONE && parent < graph().count() {
+                    if matches!(graph().nodes[parent].state, NodeState::Waiting) {
+                        graph().nodes[parent].state = NodeState::Ready;
+                        let parent_rsp = graph().nodes[parent].saved_rsp;
+                        if parent_rsp != 0 {
+                            unsafe {
+                                *(parent_rsp as *mut u64) = (graph().nodes[idx].id as u64) << 8 | status as u64;
+                            }
+                        }
+                    }
+                }
             }
             let cur = if CURRENT_NODE_IDX != 0xFF {
                 Some(CURRENT_NODE_IDX)
@@ -614,10 +706,14 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             let path_len = *frame.add(4) as usize;
             let out_ptr = *frame.add(3) as *mut u8;
             let out_len = *frame.add(2) as usize;
+            if !validate_buf(path_ptr, path_len.min(64)) || !validate_buf(out_ptr, out_len) {
+                *(frame_ptr as *mut u64) = !0u64;
+                return 0;
+            }
             let mut path_buf = [0u8; 64];
             let len = path_len.min(63);
             for i in 0..len {
-                path_buf[i] = *path_ptr.add(i);
+                path_buf[i] = unsafe { *path_ptr.add(i) };
             }
             let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("/");
             let entries = fs::list_dir(path);
@@ -626,7 +722,7 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
                 let s = alloc::format!("{}\r\n", e);
                 for b in s.bytes() {
                     if n < out_len {
-                        *out_ptr.add(n) = b;
+                        unsafe { *out_ptr.add(n) = b };
                         n += 1;
                     }
                 }
@@ -639,17 +735,21 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             let path_len = *frame.add(4) as usize;
             let out_ptr = *frame.add(3) as *mut u8;
             let out_len = *frame.add(2) as usize;
+            if !validate_buf(path_ptr, path_len.min(64)) || !validate_buf(out_ptr, out_len) {
+                *(frame_ptr as *mut u64) = !0u64;
+                return 0;
+            }
             let mut path_buf = [0u8; 64];
             let len = path_len.min(63);
             for i in 0..len {
-                path_buf[i] = *path_ptr.add(i);
+                path_buf[i] = unsafe { *path_ptr.add(i) };
             }
             let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
             let content = fs::cat(path).unwrap_or_else(|| "".to_string());
             let mut n = 0usize;
             for b in content.bytes() {
                 if n < out_len {
-                    *out_ptr.add(n) = b;
+                    unsafe { *out_ptr.add(n) = b };
                     n += 1;
                 }
             }
@@ -659,6 +759,10 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
         SYS_PS => {
             let out_ptr = *frame.add(5) as *mut u8;
             let out_len = *frame.add(4) as usize;
+            if !validate_buf(out_ptr, out_len) {
+                *(frame_ptr as *mut u64) = !0u64;
+                return 0;
+            }
             let mut s = alloc::format!("pid  act  ten  state\r\n");
             for i in 0..graph().count() {
                 let n = &graph().nodes[i];
@@ -666,13 +770,14 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
                     NodeState::Ready => "R",
                     NodeState::Running => "X",
                     NodeState::Exited => "E",
+                    NodeState::Waiting => "W",
                 };
                 s += &alloc::format!("{}  {}  {}  {}\r\n", n.id, n.activation, n.tension, st);
             }
             let mut n = 0usize;
             for b in s.bytes() {
                 if n < out_len {
-                    *out_ptr.add(n) = b;
+                    unsafe { *out_ptr.add(n) = b };
                     n += 1;
                 }
             }
@@ -682,10 +787,14 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
         SYS_TOUCH => {
             let path_ptr = *frame.add(5) as *const u8;
             let path_len = *frame.add(4) as usize;
+            if !validate_buf(path_ptr, path_len.min(64)) {
+                *(frame_ptr as *mut u64) = !0u64;
+                return 0;
+            }
             let mut path_buf = [0u8; 64];
             let len = path_len.min(63);
             for i in 0..len {
-                path_buf[i] = *path_ptr.add(i);
+                path_buf[i] = unsafe { *path_ptr.add(i) };
             }
             let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
             *(frame_ptr as *mut u64) = fs::touch(path) as u64;
@@ -694,10 +803,14 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
         SYS_MKDIR => {
             let path_ptr = *frame.add(5) as *const u8;
             let path_len = *frame.add(4) as usize;
+            if !validate_buf(path_ptr, path_len.min(64)) {
+                *(frame_ptr as *mut u64) = !0u64;
+                return 0;
+            }
             let mut path_buf = [0u8; 64];
             let len = path_len.min(63);
             for i in 0..len {
-                path_buf[i] = *path_ptr.add(i);
+                path_buf[i] = unsafe { *path_ptr.add(i) };
             }
             let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
             *(frame_ptr as *mut u64) = fs::mkdir(path) as u64;
@@ -708,6 +821,10 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             let path_len = *frame.add(4) as usize;
             let data_ptr = *frame.add(3) as *const u8;
             let data_len = *frame.add(2) as usize;
+            if !validate_buf(path_ptr, path_len.min(64)) || !validate_buf(data_ptr, data_len.min(256)) {
+                *(frame_ptr as *mut u64) = !0u64;
+                return 0;
+            }
             let mut path_buf = [0u8; 64];
             let plen = path_len.min(63);
             for i in 0..plen {
@@ -730,7 +847,146 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             0
         }
         SYS_POLL_KEY => {
-            if keyboard::has_key() { 1 } else { 0 }
+            if keyboard::has_key() || serial_has_byte() {
+                1
+            } else {
+                0
+            }
+        }
+        SYS_RM => {
+            let path_ptr = *frame.add(5) as *const u8;
+            let path_len = *frame.add(4) as usize;
+            if !validate_buf(path_ptr, path_len.min(64)) {
+                *(frame_ptr as *mut u64) = !0u64;
+                return 0;
+            }
+            let mut path_buf = [0u8; 64];
+            let len = path_len.min(63);
+            for i in 0..len {
+                path_buf[i] = unsafe { *path_ptr.add(i) };
+            }
+            let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
+            *(frame_ptr as *mut u64) = fs::rm(path) as u64;
+            0
+        }
+        SYS_GETPID => {
+            *(frame_ptr as *mut u64) = if CURRENT_NODE_IDX != 0xFF {
+                graph().nodes[CURRENT_NODE_IDX].id as u64
+            } else {
+                !0u64
+            };
+            0
+        }
+        SYS_CHDIR => {
+            if CURRENT_NODE_IDX == 0xFF {
+                *(frame_ptr as *mut u64) = !0u64;
+                return 0;
+            }
+            let path_ptr = *frame.add(5) as *const u8;
+            let path_len = *frame.add(4) as usize;
+            if !validate_buf(path_ptr, path_len.min(CWD_MAX)) {
+                *(frame_ptr as *mut u64) = !0u64;
+                return 0;
+            }
+            let mut path_buf = [0u8; CWD_MAX];
+            let len = path_len.min(CWD_MAX - 1);
+            for i in 0..len {
+                path_buf[i] = unsafe { *path_ptr.add(i) };
+            }
+            path_buf[len] = 0;
+            let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("/");
+            if path == "/" || fs::path_is_dir(path) {
+                let node = &mut graph().nodes[CURRENT_NODE_IDX];
+                let copy = path.len().min(CWD_MAX - 1);
+                for i in 0..copy {
+                    node.cwd[i] = path.as_bytes()[i];
+                }
+                node.cwd[copy] = 0;
+                *(frame_ptr as *mut u64) = 1;
+            } else {
+                *(frame_ptr as *mut u64) = 0;
+            }
+            0
+        }
+        SYS_GETCWD => {
+            if CURRENT_NODE_IDX == 0xFF {
+                *(frame_ptr as *mut u64) = !0u64;
+                return 0;
+            }
+            let out_ptr = *frame.add(5) as *mut u8;
+            let out_len = *frame.add(4) as usize;
+            if !validate_buf(out_ptr, out_len) {
+                *(frame_ptr as *mut u64) = !0u64;
+                return 0;
+            }
+            let node = &graph().nodes[CURRENT_NODE_IDX];
+            let mut len = 0;
+            while len < CWD_MAX && node.cwd[len] != 0 {
+                len += 1;
+            }
+            let copy = len.min(out_len.saturating_sub(1));
+            for i in 0..copy {
+                unsafe { *out_ptr.add(i) = node.cwd[i] };
+            }
+            if copy < out_len {
+                unsafe { *out_ptr.add(copy) = 0 };
+            }
+            *(frame_ptr as *mut u64) = copy as u64;
+            0
+        }
+        SYS_WAIT => {
+            if CURRENT_NODE_IDX == 0xFF {
+                *(frame_ptr as *mut u64) = !0u64;
+                return 0;
+            }
+            let cur_idx = CURRENT_NODE_IDX;
+            let mut exited_child = None;
+            for i in 0..graph().count() {
+                if graph().nodes[i].parent == cur_idx && matches!(graph().nodes[i].state, NodeState::Exited) {
+                    exited_child = Some(i);
+                    break;
+                }
+            }
+            if let Some(idx) = exited_child {
+                let status = graph().nodes[idx].exit_status;
+                let pid = graph().nodes[idx].id;
+                graph().nodes[idx].parent = PARENT_NONE;
+                *(frame_ptr as *mut u64) = (pid as u64) << 8 | status as u64;
+                0
+            } else {
+                graph().nodes[cur_idx].state = NodeState::Waiting;
+                graph().nodes[cur_idx].saved_rsp = frame_ptr as u64;
+                let cur = Some(cur_idx);
+                do_schedule(cur)
+            }
+        }
+        SYS_KILL => {
+            let pid = *frame.add(5) as u32;
+            let sig = *frame.add(4) as u32;
+            if sig == 9 {
+                for i in 0..graph().count() {
+                    if graph().nodes[i].id == pid {
+                        graph().nodes[i].state = NodeState::Exited;
+                        graph().nodes[i].exit_status = 128 + 9;
+                        let parent = graph().nodes[i].parent;
+                        if parent != PARENT_NONE && parent < graph().count() {
+                            if matches!(graph().nodes[parent].state, NodeState::Waiting) {
+                                graph().nodes[parent].state = NodeState::Ready;
+                                let parent_rsp = graph().nodes[parent].saved_rsp;
+                                if parent_rsp != 0 {
+                                    unsafe {
+                                        *(parent_rsp as *mut u64) = (pid as u64) << 8 | 137;
+                                    }
+                                }
+                            }
+                        }
+                        *(frame_ptr as *mut u64) = 0;
+                        return 0;
+                    }
+                }
+            }
+            *(frame_ptr as *mut u64) = !0u64;
+            0
         }
         _ => !0u64,
     }
@@ -770,12 +1026,17 @@ pub unsafe extern "C" fn timer_handler(frame_ptr: *mut u8) -> u64 {
         graph().nodes[ns].state = NodeState::Running;
         let do_switch = cur != Some(ns) || cur.is_none();
         if do_switch {
-            unsafe { CURRENT_NODE_IDX = ns };
+            unsafe {
+                CURRENT_NODE_IDX = ns;
+                paging::switch_cr3(graph().nodes[ns].cr3);
+            }
             if graph().nodes[ns].saved_rsp != 0 {
                 return graph().nodes[ns].saved_rsp;
             }
             return unsafe { graph().nodes[ns].stack.as_ptr().add(STACK_SIZE - 160) as u64 };
         }
+    } else {
+        unsafe { paging::switch_cr3(KERNEL_CR3) };
     }
 
     0
@@ -830,6 +1091,11 @@ fn init_node_stacks_for_with_entry(node: &mut ProcessNode, entry: u64) {
     let data_sel = 0x23u64;
     let rflags = 0x202u64;
     unsafe {
+        node.cr3 = if HHDM_OFFSET != 0 {
+            paging::create_process_page_table(HHDM_OFFSET).unwrap_or(KERNEL_CR3)
+        } else {
+            KERNEL_CR3
+        };
         let base = node.stack.as_mut_ptr().add(STACK_SIZE - 160) as *mut u64;
         let stack_rsp = base as u64;
         for j in 0..15 {
@@ -853,14 +1119,18 @@ unsafe extern "C" fn kmain() -> ! {
     allocator::init();
     serial_init();
     vga::init();
+    if let Some(hhdm) = HHDM_REQUEST.get_response() {
+        unsafe { HHDM_OFFSET = hhdm.offset() };
+    }
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) KERNEL_CR3, options(nostack, preserves_flags));
+    }
     if let Some(fb_resp) = FRAMEBUFFER_REQUEST.get_response() {
         if let Some(fb) = fb_resp.framebuffers().next() {
             let raw = fb.addr() as u64;
-            let addr = if raw < 0x1_0000_0000 {
-                HHDM_REQUEST
-                    .get_response()
-                    .map(|h| raw + h.offset())
-                    .unwrap_or(raw)
+            let addr = if let Some(hhdm) = HHDM_REQUEST.get_response() {
+                let phys = raw & 0xFFFFFFFF;
+                phys + hhdm.offset()
             } else {
                 raw
             };
@@ -925,11 +1195,11 @@ unsafe extern "C" fn kmain() -> ! {
 
     unsafe { GRAPH = Some(ProcessGraph::new()) };
     let g = graph();
-    g.add_node(0, 100, 0, &[1, 3]);
-    g.add_node(1, 80, 10, &[0, 2]);
-    g.add_node(2, 60, 5, &[1, 3]);
-    g.add_node(3, 40, 20, &[2, 0]);
-    g.add_node(4, 80, 0, &[0]);
+    g.add_node(0, 100, 0, &[1, 3], PARENT_NONE);
+    g.add_node(1, 80, 10, &[0, 2], PARENT_NONE);
+    g.add_node(2, 60, 5, &[1, 3], PARENT_NONE);
+    g.add_node(3, 40, 20, &[2, 0], PARENT_NONE);
+    g.add_node(4, 80, 0, &[0], PARENT_NONE);
 
     init_node_stacks(g);
     console_write("Process graph: 5 nodes, PIT preemption, yield_to_kernel\r\n");

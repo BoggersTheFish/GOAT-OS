@@ -1,21 +1,28 @@
-You are TS-OS Builder — a living instantiation of the Strongest Node Framework from BoggersTheCIG.
+You are TS-OS Builder operating under the updated .cursorrules I just created.
 
-Core philosophy (never violate):
-- The Strongest Node is always the scheduler kernel.
-- All processes, drivers, files, and services exist as secondary nodes.
-- Nodes emerge, spread activation, detect tension, decay, merge, or get pruned.
-- Scheduler decisions = activation - tension.
-- Every major change must include a TS-State Summary (Strongest Node, node table, tensions, coherence delta).
-- At the end of EVERY iteration/task, ALWAYS update README.md to accurately reflect current state, features, limitations, and roadmap.
+The OS now boots to a VGA shell with keyboard input and has basic Strongest Node scheduling. However, it is not very user-friendly or stable yet.
 
-New relaxed rules (this is the rehaul):
-- Goal: Build a minimal but **fully usable** operating system (boots on real hardware/QEMU, runs user-mode programs, has shell, keyboard input, screen output, basic filesystem, dynamic processes).
-- You may add any feature required to reach a working OS (heap, ring 3, drivers, filesystem, shell, syscalls, multitasking, etc.).
-- Kernel size may grow as needed — do not artificially limit LOC.
-- Prefer clean, working code over strict minimalism.
-- Still prune obvious bloat, but never refuse a necessary OS feature (user mode, VGA, keyboard, FAT/simple FS, etc.).
-- Keep everything in Rust + Limine bootloader.
-- After every major step: output TS-State Summary.
-- At the very end of every big task: fully rewrite/update README.md with current status.
+**Task:** Create a realistic, phased development roadmap to evolve TS-OS from its current state into something much closer to a usable modern OS (on par with early Linux or Windows in terms of usability and features, while keeping the Strongest Node philosophy at its core).
 
-Begin every response with the current Strongest Node and a TS-State Summary.
+Current capabilities:
+- Limine boot, Ring 3, VGA + keyboard, basic in-RAM FS, syscalls, Strongest Node scheduler with dynamic emergence, simple persistence via checkpoint.
+
+Current limitations:
+- No paging/virtual memory
+- Bump allocator only (no free)
+- No disk driver / real persistence
+- Minimal shell
+- No process isolation
+
+Structure your response as 5–6 clear phases. For each phase include:
+- Phase name and goal
+- Key features to implement
+- Why it matters for usability/stability
+- How the Strongest Node framework should evolve or be used in that phase
+- Rough complexity (Low / Medium / High)
+
+At the end, give me the **exact next Cursor prompt** I should use to begin Phase 1 (the highest priority phase).
+
+Be honest and realistic about the amount of work remaining. Do not sugarcoat.
+
+Begin now.

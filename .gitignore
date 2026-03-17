@@ -3,5 +3,6 @@ edk2-ovmf/
 iso_root/
 *.iso
 *.hdd
+disk.img
 kernel/kernel
 target/

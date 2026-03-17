@@ -11,26 +11,16 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 | Component | Status |
 |-----------|--------|
 | **Strongest Node** | Robust TS-OS (activation 100, tension 8) |
-| **Paging** | **Removed** – identity map only; no per-process isolation |
+| **Paging** | 4-level paging, CR3 switch per process |
 | **Heap** | Bump allocator (256 KiB, no free) |
-| **Keyboard** | Shift, caps lock, 128-byte circular buffer |
-| **Persistence** | In-RAM checkpoint (fs + graph count); restore on boot |
-| **Process graph** | Vec-based, up to 32 nodes, dynamic emergence |
-| **Process isolation** | **None** – all processes share kernel address space |
-| **VGA** | Framebuffer driver implemented; **serial-only output in practice** (QEMU window stays black) |
+| **Keyboard** | Shift, caps lock, arrows, backspace, 128-byte buffer |
+| **Persistence** | RAM + disk checkpoint; restore from disk on boot |
+| **Process graph** | Vec-based, up to 32 nodes, parent-child, wait |
+| **Process isolation** | Per-process page tables, syscall validation |
+| **VGA** | Limine framebuffer, HHDM mapping |
+| **Disk** | IDE PIO driver, 16 MB disk.img |
 
-### Node Table (Example)
-
-| Node | id | activation | tension |
-|------|-----|------------|---------|
-| 0 | 0 | 100 | 0 |
-| 1 | 1 | 80 | 10 |
-| 2 | 2 | 60 | 5 |
-| 5 | 5 | 50 | 0 |
-
-**Tensions resolved:** Allocator size, basic keyboard, fixed 32 nodes  
-**Tensions remaining:** VGA not visible in QEMU, no process isolation, persistence in-RAM only, no disk, shell minimal  
-**Coherence delta:** +4 (post-cleanup iteration)
+**Tensions resolved:** Allocator, VGA, paging, disk, shell (cd, pwd, rm, pipes, history), wait/kill
 
 ---
 
@@ -48,7 +38,7 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 | 1 | write | stdout → VGA + serial |
 | 2 | yield | Yield to scheduler |
 | 3 | spawn | Spawn process |
-| 4 | read | stdin from keyboard |
+| 4 | read | stdin from keyboard/serial |
 | 5 | exit | Exit process |
 | 6 | ls | List directory |
 | 7 | cat | Read file |
@@ -58,7 +48,13 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 | 11 | write_f | Write to file |
 | 12 | shutdown | Checkpoint and halt |
 | 13 | clear | Clear VGA screen |
-| 14 | poll_key | Non-blocking key check (1 if available, 0 else) |
+| 14 | poll_key | Non-blocking key check |
+| 15 | rm | Remove file or empty dir |
+| 16 | getpid | Get process ID |
+| 17 | chdir | Change working directory |
+| 18 | getcwd | Get working directory |
+| 19 | wait | Wait for child exit |
+| 20 | kill | Send SIGKILL to process |
 
 ### Scheduler
 - **Strongest Node** – activation − tension
@@ -95,6 +91,7 @@ make all
 ```bash
 make run
 ```
+Creates `disk.img` (16 MB) if missing. QEMU boots with CD and IDE disk.
 
 ---
 
@@ -126,12 +123,13 @@ When you boot TS-OS for the first time, **in the terminal** (where you ran `make
 4. **Shell prompt** – After the welcome, you get a normal `> ` prompt. Type commands in the terminal.
 
 **Useful commands:**
-- `help` – Full command list with descriptions
-- `about` or `welcome` – Strongest Node philosophy and current status
-- `ps` – List processes (nodes)
-- `spawn` – Create a new process
-
-**Booting:** At the Limine menu, press **ENTER** to boot. **Output is serial-only**—the QEMU window stays black. Use the terminal for the shell. The framebuffer is requested and receives a 1280×800 buffer, but writes do not appear in the QEMU display (address mapping issue).
+- `help` – Full command list; `help ls` for per-command help
+- `cd`, `pwd` – Change and print working directory
+- `ls`, `cat`, `touch`, `mkdir`, `rm` – File operations
+- `ls \| cat out.txt` – Pipes (e.g. ls output to file)
+- `cmd > file`, `cmd < file` – Redirection
+- `getpid`, `wait`, `kill PID` – Process control
+- `wc`, `head`, `tail` – Text utilities
 
 ---
 
@@ -140,13 +138,16 @@ When you boot TS-OS for the first time, **in the terminal** (where you ran `make
 ```
 BoggersTheOS/
 ├── kernel/src/
-│   ├── main.rs      # Kernel, scheduler, syscalls
+│   ├── main.rs      # Kernel, scheduler, syscalls, paging
 │   ├── allocator.rs # Bump heap (256 KiB)
-│   ├── vga.rs       # VGA text driver (Limine framebuffer)
-│   ├── keyboard.rs  # PS/2, shift, caps, ring buffer
+│   ├── paging.rs    # 4-level paging, CR3 switch
+│   ├── disk.rs      # IDE PIO driver
+│   ├── vga.rs       # VGA text driver
+│   ├── keyboard.rs  # PS/2, arrows, backspace
 │   ├── fs.rs        # In-RAM filesystem
-│   ├── persist.rs   # Checkpoint/restore
-│   └── shell.rs     # Welcome screen, help, about, commands
+│   ├── persist.rs   # Checkpoint/restore (RAM + disk)
+│   └── shell.rs     # Shell with cd, pwd, rm, pipes, history
+├── disk.img         # 16 MB IDE disk (created by make)
 └── README.md
 ```
 
@@ -154,41 +155,23 @@ BoggersTheOS/
 
 ## Honest Limitations
 
-- **Serial-only output** – VGA framebuffer driver exists but display does not appear in QEMU window; use terminal for shell
-- **No paging** – All processes share kernel address space; no isolation
-- **Bump allocator** – No free; heap grows until exhaustion
-- **Persistence** – In-RAM only; lost on power cycle
-- **No disk** – No persistent storage
 - **Keyboard** – US QWERTY scancode set 1 only
-- **Shell** – help, about, ps, echo, spawn, ls, cat, touch, mkdir, shutdown
+- **No fork/exec** – Spawn only; no ELF loader
+- **No networking** – No TCP/IP stack
+- **No fd table** – open/close/read/write via path, not fd
 
 ---
 
 ## Current Capabilities
 
-- Boots on real hardware / QEMU
-- User-mode shell with welcome screen, help, about, ps, echo, spawn, ls, cat, touch, mkdir, shutdown
-- Dynamic process creation (up to 32)
-- Checkpoint/restore of fs (and graph count) every 30s and on shutdown
-- Serial output, keyboard input
-- Strongest Node scheduler with emergence
-
----
-
-## Remaining Work (per Roadmap)
-
-### Phase 1 (Stability Foundation) – Partially done
-- [x] Fix allocator: 256 KiB bump heap (boot no longer crashes)
-- [x] Restore VGA: Limine framebuffer request, 8×8 font, 80×25 text grid
-- [ ] **VGA display in QEMU** – Framebuffer address mapping (HHDM for >4GB addresses) causes PANIC; needs investigation
-- [x] Remove debug instrumentation
-
-### Phase 2+ (Future)
-- **Restore paging** – Per-process page directories, CR3 switch
-- **Heap with free** – Linked-list or similar for long-running use
-- **Disk persistence** – Write checkpoint to disk
-- **More shell commands** – cd, pwd, rm
-- **Syscall validation** – Bounds-check user pointers
+- Boots on real hardware / QEMU with disk
+- Per-process paging, syscall validation
+- Bump allocator (256 KiB)
+- VGA + serial output, keyboard + serial input
+- Disk persistence (checkpoint to disk.img)
+- Shell: cd, pwd, rm, pipes, redirection, history, getpid, wait, kill
+- Utilities: wc, head, tail; help &lt;cmd&gt;
+- Parent-child process tracking, wait for child exit
 
 ---
 
