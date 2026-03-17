@@ -1,8 +1,8 @@
 # TS-OS – Strongest Node Operating System (Rust Implementation)
 
-TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strongest Node Framework** from [BoggersTheCIG](https://github.com/BoggersTheFish/BoggersTheCIG). The kernel is the Strongest Node; every other component exists only as secondary nodes that dynamically emerge, strengthen, spread activation, detect tension, decay, merge, or get pruned. The architecture follows the full cognitive loop: kernel = core_engine (structural search, pattern discovery, constraint resolution); emergence = triple extraction → graph nodes (processes); spreading activation = scheduler decisions; tension detection = bugs, inefficiency, contradiction, bloat; memory decay = prune inactive/low-degree nodes; convergence = self-organization; self-improvement = coherence check with rollback on failure.
+TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strongest Node Framework** from [BoggersTheCIG](https://github.com/BoggersTheFish/BoggersTheCIG). The kernel is the Strongest Node; every other component exists only as secondary nodes that dynamically emerge, strengthen, spread activation, detect tension, decay, merge, or get pruned.
 
-**This repo replaces the previous GOAT-OS C prototype.** It is the first full application of the TS framework from https://github.com/BoggersTheFish/BoggersTheCIG to the OS domain.
+**This repo replaces the previous GOAT-OS C prototype.** It is the first full application of the TS framework to the OS domain.
 
 ---
 
@@ -10,87 +10,103 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 
 | Component | Status |
 |-----------|--------|
-| **Strongest Node** | User-mode foundation + syscall interface (activation 100, tension 0) |
-| **Secondary nodes** | 5 process nodes in static graph |
+| **Strongest Node** | Full usable TS-OS (kernel + scheduler, activation 100, tension 0) |
+| **Secondary nodes** | 5 static + dynamic emergence when tension > 30 |
+| **User mode** | Ring 3 via GDT user segments, iretq, syscall DPL=3 |
+| **Heap** | Linked-list allocator with free (128 KiB) |
+| **Syscalls** | write, yield, spawn, read, exit, ls, cat, ps, touch, mkdir, write_f |
+| **Drivers** | VGA text (0xB8000), PS/2 keyboard, serial (COM1) |
+| **Filesystem** | In-RAM tree (nodes as files/directories) |
+| **Shell** | User-mode shell (help, ps, echo, spawn, ls, cat, touch, mkdir, exit) |
 
-### Node Table
+### Node Table (Initial)
 
-| Node | id | activation | tension | neighbors |
-|------|-----|------------|---------|-----------|
-| 0 | 0 | 100 | 0 | 1, 3 |
-| 1 | 1 | 80 | 10 | 0, 2 |
-| 2 | 2 | 60 | 5 | 1, 3 |
-| 3 | 3 | 40 | 20 | 2, 0 |
-| 4 | 4 | 80 | 0 | 0 |
+| Node | id | activation | tension | role |
+|------|-----|------------|---------|------|
+| 0 | 0 | 100 | 0 | Shell |
+| 1 | 1 | 80 | 10 | Worker |
+| 2 | 2 | 60 | 5 | Worker |
+| 3 | 3 | 40 | 20 | Worker |
+| 4 | 4 | 80 | 0 | Worker |
 
-**Tensions resolved:** No syscall interface  
-**Tensions remaining:** No actual ring 3 (nodes still ring 0), no dynamic process creation, no filesystem, serial-only, no shell  
-**Coherence delta:** +1 (GDT user segments, TSS, INT 0x80 syscalls)
+**Tensions resolved:** Ring 3, heap free, syscalls, VGA, keyboard, filesystem, shell  
+**Tensions remaining:** No paging (identity map; ring 3 may fault on some hardware), no coalescing in allocator, keyboard scancode set 1 only  
+**Coherence delta:** +7 (full iteration complete)
 
 ---
 
 ## Implemented Features
 
-- **Boot with Limine** – x86_64 bare-metal boot via Limine bootloader (BIOS + UEFI)
-- **Bump heap allocator** – 64 KiB static backing, GlobalAlloc, atomic bump pointer, no free
-- **GDT user segments + TSS** – User code/data segments (ring 3), TSS with kernel stack for interrupts
-- **Syscall interface (INT 0x80)** – sys_write (1), sys_yield (2), sys_spawn (3, stub)
-- **Node entries use syscalls** – do_sys_write, do_sys_yield via int 0x80
-- **PIT timer interrupt** – Real ~10ms tick (11932 divisor), PIC remapped, IRQ0 → vector 32
-- **Preemptive scheduler** – Timer fires, saves full context, runs decay/spread/select, switches via iretq
-- **GDT + IDT** – x86_64 crate for GDT (kernel + user segments, TSS), IDT with timer + syscall stubs
-- **Static ProcessGraph** – In-RAM process graph with `[ProcessNode; 8]`
-- **Per-node 4 KiB stacks** – Each node has `stack: [u8; 4096]`, `saved_rip`, `saved_rsp`
-- **Real context switch** – Assembly stub saves GPRs, timer_handler/syscall_handler returns new frame ptr, iretq restores
-- **Spreading activation scheduler** – Select strongest node by `activation - tension`; running node spreads +10 to neighbors
+### Core
+- **Boot with Limine** – x86_64 bare-metal boot (BIOS + UEFI)
+- **Linked-list heap** – 128 KiB, GlobalAlloc with alloc + dealloc, first-fit, block splitting
+- **GDT + TSS** – Kernel + user code/data segments, TSS with kernel stack for interrupts
+- **Ring 3 user mode** – User CS (0x1b), user SS (0x23), iretq to user code
+- **Syscall interface (INT 0x80)** – DPL=3 so user can invoke
+
+### Syscalls
+| # | Name | Description |
+|---|------|-------------|
+| 1 | write | Write to fd 1 (stdout → VGA + serial) |
+| 2 | yield | Yield to scheduler |
+| 3 | spawn | Spawn new process node |
+| 4 | read | Read from fd 0 (stdin → keyboard) |
+| 5 | exit | Exit process |
+| 6 | ls | List directory |
+| 7 | cat | Read file |
+| 8 | ps | List processes |
+| 9 | touch | Create file |
+| 10 | mkdir | Create directory |
+| 11 | write_f | Write to file |
+
+### Scheduler
+- **Strongest Node** – Select by `activation - tension`
+- **Spreading activation** – Running node spreads +10 to neighbors
 - **Decay** – Inactive nodes lose 2 activation per tick
-- **Switch only when different** – Context switch only when the newly selected strongest node differs from the previous
-- **Serial output** – COM1 (0x3F8) for all output; QEMU `-serial stdio` shows output in terminal
-- **Node entry functions** – Node 0 stats, Node 1 "alive", Node 4 "working"; use sys_write + sys_yield
+- **Tension bump** – Preempted node gains +1 tension
+- **Dynamic emergence** – When max tension > 30, spawn new node (if room)
+
+### Drivers
+- **VGA text** – 80×25, 0xB8000, scroll on newline
+- **PS/2 keyboard** – Ports 0x60/0x64, scancode set 1 → ASCII
+- **Serial** – COM1 (0x3F8) for debug
+
+### Filesystem
+- **In-RAM tree** – Nodes as files/directories
+- **Operations** – mkdir, touch, read_file, write_file, list_dir
+- **Paths** – Unix-style (/path/to/file)
+
+### Shell (User Mode)
+- **Commands:** help, ps, echo, spawn, ls, cat, touch, mkdir, exit
+- **Echo to file:** `echo "text" > path`
+- **Runs as node 0** – First scheduled process
 
 ---
 
 ## Build & Run
 
 ### Requirements
-
 - **Rust** (nightly): `rustup default nightly`
 - **GNU Make** (MSYS2, WSL, or MinGW on Windows)
 - **xorriso** (for ISO generation)
-- **QEMU** (optional, for testing)
+- **QEMU** (optional)
 
 ### Build
-
 ```bash
 make all
 ```
-
 Produces `ts-os-x86_64.iso`.
 
 ### Run in QEMU
-
 ```bash
 make run
 ```
+VGA appears in QEMU window; serial in terminal (`-serial stdio`).
 
-Serial output appears in the terminal (QEMU uses `-serial stdio` by default).
-
-### UEFI Run
-
+### UEFI
 ```bash
 make run-uefi
 ```
-
-### Windows Fallback
-
-If `make` is unavailable, build the kernel only:
-
-```powershell
-cd kernel
-cargo build --target x86_64-unknown-none
-```
-
-Copy `target/x86_64-unknown-none/debug/ts-os-kernel` to `kernel/kernel` and use xorriso/Limine manually for ISO creation.
 
 ---
 
@@ -98,64 +114,44 @@ Copy `target/x86_64-unknown-none/debug/ts-os-kernel` to `kernel/kernel` and use 
 
 ```
 BoggersTheOS/
-├── .cursorrules.txt      # TS-OS Builder rules (Strongest Node loop)
-├── .gitignore
-├── GNUmakefile           # Root build (Limine + kernel → ISO)
-├── limine.conf           # Bootloader config
-├── LICENSE               # MIT
-├── README.md
-├── build.ps1             # Windows kernel-only build helper
-└── kernel/
-    ├── Cargo.toml        # ts-os-kernel, limine 0.5, x86_64 0.14
-    ├── build.rs
-    ├── GNUmakefile
-    ├── linker-x86_64.ld
-    ├── rust-toolchain.toml  # nightly, x86_64-unknown-none
-    └── src/
-        ├── main.rs       # ~400 LOC
-        └── idt.S         # Timer interrupt stub (minimal asm)
+├── .cursorrules.txt
+├── GNUmakefile
+├── limine.conf
+├── kernel/
+│   ├── Cargo.toml
+│   ├── build.rs
+│   ├── linker-x86_64.ld
+│   └── src/
+│       ├── main.rs      # Kernel entry, scheduler, syscalls
+│       ├── allocator.rs # Linked-list heap
+│       ├── vga.rs       # VGA text driver
+│       ├── keyboard.rs # PS/2 keyboard
+│       ├── fs.rs        # In-RAM filesystem
+│       ├── shell.rs     # User-mode shell
+│       └── idt.S        # Timer + syscall stubs
+└── README.md
 ```
 
 ---
 
-## .cursorrules Summary (Iron-Clad Rules)
+## Honest Limitations
 
-- **Essential features ONLY** – Prune aggressively; nothing beyond boot, one user process, self-stabilization
-- **Microkernel architecture** – Kernel stays tiny (< 10k LOC target)
-- **Written 100% in Rust** – No C, no assembly except minimal boot
-- **Limine bootloader** – Real hardware boot capability
-- **No POSIX, no full libc** – No unnecessary drivers in v1
-- **Scheduler = Strongest Node** – Pure weighted spreading activation, no traditional priority queues
-- **File system = in-RAM node graph** – No disk yet
-- **After every change** – State Strongest Node, list secondary nodes, detect tensions, generate hypotheses, choose simplest, implement, coherence check, rollback if needed
-
----
-
-## Philosophy & Design Principles
-
-- **Strongest Node drives everything** – The kernel is the core; all else emerges as secondary nodes
-- **Secondary nodes = processes** – Process graph with activation, tension, neighbors
-- **Emergence** – Nodes are added at boot; future: triple extraction from workload
-- **Tension resolution** – Bugs, inefficiency, contradiction, bloat are tensions; detected and resolved
-- **Coherence rollback** – Every change triggers coherence check; if coherence drops >10% or tests fail → automatic rollback + backup
-- **Never design the whole OS at once** – Architecture emerges node-by-node
+- **No paging** – Identity mapping from bootloader; ring 3 may fault if pages lack user bit
+- **No coalescing** – Free blocks not merged; fragmentation possible
+- **Fixed node cap** – MAX_NODES=8; graph is static array
+- **Keyboard** – US QWERTY scancode set 1 only; no shift/caps
+- **Filesystem** – In-RAM only; lost on reboot
+- **No disk** – No persistent storage
+- **Single address space** – No process isolation
 
 ---
 
-## Roadmap / Next Hypotheses
+## Roadmap
 
-After push, the next Strongest Node candidates:
-
-1. **Actual ring 3** – iretq to user CS/SS (requires user-accessible page; paging changes)
-2. **Dynamic process emergence** – sys_spawn creates nodes at runtime using heap
-3. **In-RAM file system** – Hierarchical node graph as files (no disk, pure RAM)
-4. **Process emergence from workload** – Triple extraction: spawn nodes from detected patterns
-
----
-
-## Current Limitations
-
-This is still a minimal research kernel, not a complete usable OS. Nodes run in ring 0 (kernel mode); GDT/TSS and syscall interface are in place for future ring 3. No shell, no filesystem, no keyboard/VGA. Serial-only output. Process graph is fixed at boot. sys_spawn is a stub. The heap is bump-only (no free). Architecture emerges node-by-node per .cursorrules.
+1. **Paging** – User-accessible pages for reliable ring 3
+2. **Heap coalescing** – Merge adjacent free blocks
+3. **Dynamic graph** – Heap-allocated ProcessGraph, grow beyond 8 nodes
+4. **Process isolation** – Per-process address spaces
 
 ---
 
@@ -165,4 +161,4 @@ MIT (same as BoggersTheCIG).
 
 ---
 
-*Built continuously with the exact same cognitive loop as BoggersTheCIG.*
+*Built with the Strongest Node cognitive loop from BoggersTheCIG.*
