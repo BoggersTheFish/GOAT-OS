@@ -5,6 +5,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 const COLS: usize = 80;
 const ROWS: usize = 25;
+const CONTENT_ROWS: usize = 24;
+const STATUS_ROW: usize = 24;
 const CHAR_W: usize = 8;
 const CHAR_H: usize = 8;
 
@@ -171,6 +173,10 @@ pub fn init_framebuffer(addr: *mut u8, width: u64, height: u64, pitch: u64, bpp:
     }
 }
 
+pub fn is_enabled() -> bool {
+    unsafe { VGA_ENABLED && !FB_ADDR.is_null() }
+}
+
 fn draw_char(c: u8, col: usize, row: usize) {
     if !unsafe { VGA_ENABLED } || unsafe { FB_ADDR.is_null() } {
         return;
@@ -253,9 +259,9 @@ fn newline() {
         return;
     }
     let r = ROW.load(Ordering::SeqCst);
-    if r + 1 >= ROWS {
+    if r + 1 >= CONTENT_ROWS {
         scroll();
-        ROW.store(ROWS - 1, Ordering::SeqCst);
+        ROW.store(CONTENT_ROWS - 1, Ordering::SeqCst);
     } else {
         ROW.store(r + 1, Ordering::SeqCst);
     }
@@ -267,7 +273,7 @@ fn scroll() {
         return;
     }
     let bytes_per_pixel = (unsafe { FB_BPP } as usize + 7) / 8;
-    let scroll_pixel_rows = (ROWS - 1) * CHAR_H;
+    let scroll_pixel_rows = (CONTENT_ROWS - 1) * CHAR_H;
     unsafe {
         if scroll_pixel_rows * FB_PITCH <= FB_PITCH * FB_HEIGHT {
             core::ptr::copy(
@@ -276,7 +282,7 @@ fn scroll() {
                 scroll_pixel_rows * FB_PITCH,
             );
         }
-        for row in (ROWS - 1) * CHAR_H..ROWS * CHAR_H {
+        for row in (CONTENT_ROWS - 1) * CHAR_H..CONTENT_ROWS * CHAR_H {
             if row >= FB_HEIGHT {
                 break;
             }
@@ -297,7 +303,22 @@ fn scroll() {
             }
         }
     }
-    ROW.store(ROWS - 1, Ordering::SeqCst);
+    ROW.store(CONTENT_ROWS - 1, Ordering::SeqCst);
+}
+
+/// Update the bottom status bar. Call from kernel with graph stats.
+pub fn update_status_bar(nodes: usize, act: u32, tension: u32) {
+    if !is_enabled() {
+        return;
+    }
+    let s = crate::alloc::format!(" nodes:{} act:{} ten:{} ", nodes, act, tension);
+    let bytes = s.as_bytes();
+    for (col, &b) in bytes.iter().take(COLS).enumerate() {
+        draw_char(b, col, STATUS_ROW);
+    }
+    for col in bytes.len()..COLS {
+        draw_char(b' ', col, STATUS_ROW);
+    }
 }
 
 pub fn write_byte(b: u8) {

@@ -3,7 +3,8 @@ MAKEFLAGS += -rR
 
 override USER_VARIABLE = $(if $(filter $(origin $(1)),default undefined),$(eval override $(1) := $(2)))
 $(call USER_VARIABLE,KARCH,x86_64)
-$(call USER_VARIABLE,QEMUFLAGS,-m 2G -serial stdio)
+# run: VGA primary, no serial (clean in-VM experience)
+# run-debug: serial stdio for host terminal debugging
 
 override IMAGE_NAME := ts-os-$(KARCH)
 DISK_IMG := disk.img
@@ -19,14 +20,19 @@ $(DISK_IMG):
 .PHONY: run
 run: $(IMAGE_NAME).iso $(DISK_IMG)
 	qemu-system-$(KARCH) -M q35 -cdrom $(IMAGE_NAME).iso -boot d \
-		-drive file=$(DISK_IMG),format=raw,if=ide $(QEMUFLAGS)
+		-drive file=$(DISK_IMG),format=raw,if=ide -m 2G -display gtk
+
+.PHONY: run-debug
+run-debug: $(IMAGE_NAME).iso $(DISK_IMG)
+	qemu-system-$(KARCH) -M q35 -cdrom $(IMAGE_NAME).iso -boot d \
+		-drive file=$(DISK_IMG),format=raw,if=ide -m 2G -serial stdio -display gtk
 
 .PHONY: run-uefi
 run-uefi: edk2-ovmf $(IMAGE_NAME).iso $(DISK_IMG)
 	qemu-system-$(KARCH) -M q35 \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(KARCH).fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
-		-drive file=$(DISK_IMG),format=raw,if=ide $(QEMUFLAGS)
+		-drive file=$(DISK_IMG),format=raw,if=ide -m 2G -display gtk
 
 edk2-ovmf:
 	curl -L https://github.com/osdev0/edk2-ovmf-nightly/releases/latest/download/edk2-ovmf.tar.gz | gunzip | tar -xf -

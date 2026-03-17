@@ -226,8 +226,8 @@ fn serial_write(s: &str) {
 }
 
 fn console_write(s: &str) {
-    serial_write(s);
     vga::write_str(s);
+    serial_write(s);
 }
 
 fn serial_write_u32(n: u32) {
@@ -1022,6 +1022,13 @@ pub unsafe extern "C" fn timer_handler(frame_ptr: *mut u8) -> u64 {
     }
 
     let new_strongest = graph().select_strongest();
+    if TICK_COUNT % 10 == 0 {
+        if let Some(ns) = new_strongest {
+            vga::update_status_bar(graph().count(), graph().nodes[ns].activation, graph().nodes[ns].tension);
+        } else {
+            vga::update_status_bar(graph().count(), 0, 0);
+        }
+    }
     if let Some(ns) = new_strongest {
         graph().nodes[ns].state = NodeState::Running;
         let do_switch = cur != Some(ns) || cur.is_none();
@@ -1127,22 +1134,12 @@ unsafe extern "C" fn kmain() -> ! {
     }
     if let Some(fb_resp) = FRAMEBUFFER_REQUEST.get_response() {
         if let Some(fb) = fb_resp.framebuffers().next() {
-            let raw = fb.addr() as u64;
+            let phys = fb.addr() as u64;
             let addr = if let Some(hhdm) = HHDM_REQUEST.get_response() {
-                let phys = raw & 0xFFFFFFFF;
                 phys + hhdm.offset()
             } else {
-                raw
+                phys
             };
-            serial_write("FB: ");
-            serial_write_hex(raw);
-            serial_write(" -> ");
-            serial_write_hex(addr);
-            serial_write(" ");
-            serial_write_u32(fb.width() as u32);
-            serial_write("x");
-            serial_write_u32(fb.height() as u32);
-            serial_write("\r\n");
             vga::init_framebuffer(addr as *mut u8, fb.width(), fb.height(), fb.pitch(), fb.bpp());
         } else {
             serial_write("FB: no framebuffers\r\n");

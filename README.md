@@ -17,10 +17,10 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 | **Persistence** | RAM + disk checkpoint; restore from disk on boot |
 | **Process graph** | Vec-based, up to 32 nodes, parent-child, wait |
 | **Process isolation** | Per-process page tables, syscall validation |
-| **VGA** | Limine framebuffer, HHDM mapping |
+| **VGA** | Limine framebuffer, HHDM mapping, **primary output** |
 | **Disk** | IDE PIO driver, 16 MB disk.img |
 
-**Tensions resolved:** Allocator, VGA, paging, disk, shell (cd, pwd, rm, pipes, history), wait/kill
+**Tensions resolved:** Allocator, VGA (visible in QEMU), paging, disk, shell (cd, pwd, rm, pipes, history), wait/kill
 
 ---
 
@@ -64,9 +64,9 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 - **Dynamic emergence** – Spawn when max tension > 30 (up to 32 nodes)
 
 ### Drivers
-- **VGA** – Limine framebuffer request, 8×8 font, 80×25 text grid (code present; display not visible in QEMU—use serial)
-- **PS/2 keyboard** – Shift, caps lock, 128-byte ring buffer
-- **Serial** – COM1 (primary output)
+- **VGA** – Limine framebuffer, 8×8 font, 80×25 text grid, status bar (nodes/act/tension). Primary output.
+- **PS/2 keyboard** – Shift, caps lock, arrows, backspace. Primary input.
+- **Serial** – COM1 (optional; use `make run-debug` for serial to host terminal)
 
 ### Filesystem
 - **In-RAM tree** – mkdir, touch, read, write, list
@@ -91,45 +91,62 @@ make all
 ```bash
 make run
 ```
-Creates `disk.img` (16 MB) if missing. QEMU boots with CD and IDE disk.
+Creates `disk.img` (16 MB) if missing. QEMU opens a **VGA window**—all interaction happens inside the OS.
+
+For serial output to the host terminal (debugging):
+```bash
+make run-debug
+```
 
 ---
 
-## First Boot Experience
+## Boot Experience
 
-When you boot TS-OS for the first time, **in the terminal** (where you ran `make run`) you will see:
+When you run `make run`, a QEMU window opens. At the Limine menu, press **ENTER** to boot TS-OS.
 
-1. **Kernel messages** – Serial init, framebuffer info (FB: 0x... -> 0x... 1280x800), process graph setup.
-2. **Welcome screen** – A centered banner (via serial):
+1. **Kernel boot** – Brief messages (Strongest Node online, process graph, Heap OK).
+2. **Welcome screen** – Shown on VGA:
    ```
      ==========================================
                T S - O S
      ==========================================
 
-     This is a living operating system powered by the
-     Strongest Node Framework from BoggersTheCIG.
+     A living OS powered by the Strongest Node Framework.
+     The kernel is the core; processes emerge from tension.
 
-     Basic commands:
-       help   - show full command list
-       ps     - list processes (nodes)
-       spawn  - spawn new process
-       ...
+     Basic commands: help  ps  ls  cat  cd  pwd  rm  spawn
      Type 'help' for full command list.
-     Nodes emerge automatically based on system tension.
 
-     Press any key to continue, or wait 4 seconds...
+     [Click this window and type. Status bar: nodes, act, tension]
+
+     Press any key or wait 4 seconds...
    ```
-3. **Wait or skip** – The welcome stays for ~4 seconds, or press any key to continue.
-4. **Shell prompt** – After the welcome, you get a normal `> ` prompt. Type commands in the terminal.
+3. **Shell prompt** – After the welcome, you get `> `. **Click the QEMU window** and type. The bottom status bar shows node count, strongest activation, and tension.
 
-**Useful commands:**
-- `help` – Full command list; `help ls` for per-command help
-- `cd`, `pwd` – Change and print working directory
-- `ls`, `cat`, `touch`, `mkdir`, `rm` – File operations
-- `ls \| cat out.txt` – Pipes (e.g. ls output to file)
-- `cmd > file`, `cmd < file` – Redirection
-- `getpid`, `wait`, `kill PID` – Process control
-- `wc`, `head`, `tail` – Text utilities
+---
+
+## How to Use
+
+**Interaction is inside the QEMU window.** Click the window to give it focus, then type.
+
+| Command | Description |
+|---------|-------------|
+| `help` | Full command list; `help ls` for per-command help |
+| `cd`, `pwd` | Change and print working directory |
+| `ls`, `cat`, `touch`, `mkdir`, `rm` | File operations |
+| `ls \| cat out.txt` | Pipes (e.g. ls output to file) |
+| `cmd > file`, `cmd < file` | Redirection |
+| `getpid`, `wait`, `kill PID` | Process control |
+| `wc`, `head`, `tail` | Text utilities |
+
+**Test commands:**
+```bash
+make all
+make run
+# In Limine: press ENTER
+# In TS-OS: click window, type "help", press ENTER
+# Type "ls" then "cat readme.txt"
+```
 
 ---
 
@@ -188,6 +205,33 @@ BoggersTheOS/
 ## License
 
 MIT (same as BoggersTheCIG).
+
+---
+
+---
+
+## TS-State Summary (This Step)
+
+| Metric | Before | After |
+|--------|--------|-------|
+| VGA visibility | Black screen in QEMU | Framebuffer mapped via full phys + HHDM |
+| Output primary | Serial | VGA (serial optional via run-debug) |
+| Input primary | Keyboard or serial | PS/2 keyboard |
+| Welcome | In host terminal | On VGA inside VM |
+| Status bar | None | Bottom row: nodes, act, tension |
+| make run | Serial stdio | VGA window, no serial |
+
+**Exact test commands:**
+```bash
+cd BoggersTheOS
+make all
+make run
+# 1. At Limine: press ENTER
+# 2. Click the QEMU window
+# 3. Type: help
+# 4. Type: ls
+# 5. Type: cat readme.txt
+```
 
 ---
 
