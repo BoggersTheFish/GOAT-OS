@@ -11,25 +11,25 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 | Component | Status |
 |-----------|--------|
 | **Strongest Node** | Robust TS-OS (activation 100, tension 8) |
-| **Paging** | 4-level, identity map kernel, user 0–2 MiB (U=1) |
-| **Heap** | Linked-list with coalescing + defrag (frag > 25%) |
+| **Paging** | **Removed** – identity map only; no per-process isolation |
+| **Heap** | Simple bump allocator (64 KiB, no free) |
 | **Keyboard** | Shift, caps lock, 128-byte circular buffer |
-| **Persistence** | Checkpoint graph+fs every 30s, restore on boot |
+| **Persistence** | In-RAM checkpoint (fs + graph count); restore on boot |
 | **Process graph** | Vec-based, up to 32 nodes, dynamic emergence |
-| **Process isolation** | Per-process page directory, CR3 switch on schedule |
+| **Process isolation** | **None** – all processes share kernel address space |
 
 ### Node Table (Example)
 
-| Node | id | activation | tension | cr3 |
-|------|-----|------------|---------|-----|
-| 0 | 0 | 100 | 0 | 0 (shared) |
-| 1 | 1 | 80 | 10 | 0 |
-| 2 | 2 | 60 | 5 | 0 |
-| 5 | 5 | 50 | 0 | per-process |
+| Node | id | activation | tension |
+|------|-----|------------|---------|
+| 0 | 0 | 100 | 0 |
+| 1 | 1 | 80 | 10 |
+| 2 | 2 | 60 | 5 |
+| 5 | 5 | 50 | 0 |
 
-**Tensions resolved:** No paging, no coalescing, basic keyboard, no persistence, fixed 8 nodes, no isolation  
-**Tensions remaining:** Persistence is in-RAM (lost on power cycle), no disk, shell still minimal  
-**Coherence delta:** +6 (full iteration)
+**Tensions resolved:** No paging, bump allocator, basic keyboard, fixed 32 nodes  
+**Tensions remaining:** No process isolation, persistence in-RAM only, no disk, shell minimal  
+**Coherence delta:** +4 (post-cleanup iteration)
 
 ---
 
@@ -37,17 +37,16 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 
 ### Core
 - **Boot with Limine** – x86_64 bare-metal (BIOS + UEFI)
-- **4-level paging** – Identity map kernel, user 0–2 MiB (U=1), per-process page dirs
-- **Linked-list heap** – 128 KiB, coalescing on free, defrag when frag > 25%
 - **GDT + TSS** – Kernel + user segments, TSS for kernel stack
 - **Ring 3 user mode** – User CS/SS, iretq, syscall DPL=3
+- **Bump heap** – 64 KiB, no free (sufficient for current use)
 
 ### Syscalls
 | # | Name | Description |
 |---|------|-------------|
 | 1 | write | stdout → VGA + serial |
 | 2 | yield | Yield to scheduler |
-| 3 | spawn | Spawn process (own page dir) |
+| 3 | spawn | Spawn process |
 | 4 | read | stdin from keyboard |
 | 5 | exit | Exit process |
 | 6 | ls | List directory |
@@ -74,17 +73,16 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 - **In-RAM tree** – mkdir, touch, read, write, list
 - **Persistence** – Serialize to reserved region every 30s, on shutdown; restore on boot
 
-### Process Isolation
-- **Per-process page directory** – Spawned processes get own CR3
-- **User stack** – Mapped at 0x1000–0x2000 per process
-
 ---
 
 ## Build & Run
 
 ### Requirements
 - Rust (nightly)
+- **C compiler** (gcc or clang) – for assembling `idt.S` (build script)
 - GNU Make, xorriso, QEMU (optional)
+
+On Windows, use WSL, MSYS2, or install a cross-toolchain (e.g. `x86_64-elf-gcc`).
 
 ### Build
 ```bash
@@ -104,14 +102,13 @@ make run
 BoggersTheOS/
 ├── kernel/src/
 │   ├── main.rs      # Kernel, scheduler, syscalls
-│   ├── allocator.rs # Heap + coalescing + defrag
-│   ├── paging.rs    # 4-level paging, per-process CR3
+│   ├── allocator.rs # Bump heap (64 KiB)
 │   ├── vga.rs
 │   ├── keyboard.rs  # Shift, caps, ring buffer
 │   ├── fs.rs
 │   ├── persist.rs   # Checkpoint/restore
 │   ├── shell.rs
-│   └── idt.S
+│   └── idt.S        # Timer + syscall stubs
 └── README.md
 ```
 
@@ -119,12 +116,12 @@ BoggersTheOS/
 
 ## Honest Limitations
 
+- **No paging** – All processes share kernel address space; no isolation
+- **Bump allocator** – No free; heap grows until exhaustion
 - **Persistence** – In-RAM only; lost on power cycle
 - **No disk** – No persistent storage
 - **Keyboard** – US QWERTY scancode set 1 only
-- **Defrag** – Merges adjacent free blocks only; no moving of allocated blocks
-- **Process isolation** – Per-process address space; kernel still shared
-- **Shell** – Minimal
+- **Shell** – Minimal (help, ps, echo, spawn, ls, cat, touch, mkdir, shutdown)
 
 ---
 
@@ -133,7 +130,6 @@ BoggersTheOS/
 - Boots on real hardware / QEMU
 - User-mode shell with help, ps, echo, spawn, ls, cat, touch, mkdir, shutdown
 - Dynamic process creation (up to 32)
-- Per-process page tables for spawned processes
 - Checkpoint/restore of fs (and graph count) every 30s and on shutdown
 - VGA + serial output, keyboard input
 - Strongest Node scheduler with emergence
@@ -142,10 +138,11 @@ BoggersTheOS/
 
 ## Remaining Work
 
-1. **Disk persistence** – Write checkpoint to disk
-2. **Full heap defrag** – Move allocated blocks
-3. **More shell commands** – cd, pwd, rm
-4. **Syscall validation** – Bounds-check user pointers
+1. **Restore paging** – Per-process page directories, CR3 switch
+2. **Heap with free** – Linked-list or similar for long-running use
+3. **Disk persistence** – Write checkpoint to disk
+4. **More shell commands** – cd, pwd, rm
+5. **Syscall validation** – Bounds-check user pointers
 
 ---
 

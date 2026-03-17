@@ -2,7 +2,7 @@
 //!
 //! Kernel = core_engine (structural search, pattern discovery, constraint resolution)
 //! Scheduler = pure Strongest Node weighted spreading activation
-//! PIT timer interrupt + preemptive scheduler + linked-list heap with free
+//! PIT timer interrupt + preemptive scheduler + bump heap
 
 #![no_std]
 #![no_main]
@@ -13,7 +13,6 @@ extern crate alloc;
 mod allocator;
 mod fs;
 mod keyboard;
-mod paging;
 mod persist;
 mod shell;
 mod vga;
@@ -22,7 +21,7 @@ use core::alloc::Layout;
 use core::arch::asm;
 use core::mem::MaybeUninit;
 
-use limine::request::{HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker};
+use limine::request::{RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::idt::InterruptDescriptorTable;
@@ -33,14 +32,6 @@ use x86_64::VirtAddr;
 #[used]
 #[unsafe(link_section = ".requests")]
 static BASE_REVISION: BaseRevision = BaseRevision::new();
-
-#[used]
-#[unsafe(link_section = ".requests")]
-static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
-
-#[used]
-#[unsafe(link_section = ".requests")]
-static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -85,7 +76,7 @@ static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_SIZE]);
 static mut TSS: MaybeUninit<TaskStateSegment> = MaybeUninit::uninit();
 
 #[global_allocator]
-static HEAP: allocator::LinkedListAllocator = allocator::LinkedListAllocator;
+static HEAP: allocator::BumpAllocator = allocator::BumpAllocator;
 
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
@@ -155,7 +146,6 @@ struct ProcessNode {
     stack: [u8; STACK_SIZE],
     saved_rip: u64,
     saved_rsp: u64,
-    cr3: u64,
 }
 
 impl ProcessNode {
@@ -169,7 +159,6 @@ impl ProcessNode {
             stack: [0u8; STACK_SIZE],
             saved_rip: 0,
             saved_rsp: 0,
-            cr3: 0,
         }
     }
 
@@ -212,7 +201,6 @@ impl ProcessGraph {
             stack: [0u8; STACK_SIZE],
             saved_rip: 0,
             saved_rsp: 0,
-            cr3: 0,
         });
         true
     }
@@ -411,9 +399,6 @@ fn maybe_emerge_node() {
     if max_tension > 30 && graph().count() < MAX_NODES {
         let next_id = graph().count() as u32;
         if let Some(idx) = graph().try_add_node(next_id, 50, 0, &[]) {
-            if let Some(cr3) = paging::create_process_page_tables() {
-                graph().nodes[idx].cr3 = cr3;
-            }
             init_node_stacks_for(&mut graph().nodes[idx]);
             graph().nodes[idx].state = NodeState::Ready;
         }
@@ -433,9 +418,6 @@ fn do_schedule(cur: Option<usize>) -> u64 {
         let do_switch = cur != Some(ns) || cur.is_none();
         if do_switch {
             CURRENT_NODE_IDX = ns;
-            if graph().nodes[ns].cr3 != 0 {
-                paging::switch_cr3(graph().nodes[ns].cr3);
-            }
             if graph().nodes[ns].saved_rsp != 0 {
                 return graph().nodes[ns].saved_rsp;
             }
@@ -491,9 +473,6 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             let next_id = graph().count() as u32;
             let frame_mut = frame_ptr as *mut u64;
             if let Some(idx) = graph().try_add_node(next_id, 50, 0, &[]) {
-                if let Some(cr3) = paging::create_process_page_tables() {
-                    graph().nodes[idx].cr3 = cr3;
-                }
                 init_node_stacks_for(&mut graph().nodes[idx]);
                 graph().nodes[idx].state = NodeState::Ready;
                 *frame_mut.add(0) = idx as u64;
@@ -671,9 +650,6 @@ pub unsafe extern "C" fn timer_handler(frame_ptr: *mut u8) -> u64 {
         let do_switch = cur != Some(ns) || cur.is_none();
         if do_switch {
             CURRENT_NODE_IDX = ns;
-            if graph().nodes[ns].cr3 != 0 {
-                paging::switch_cr3(graph().nodes[ns].cr3);
-            }
             if graph().nodes[ns].saved_rsp != 0 {
                 return graph().nodes[ns].saved_rsp;
             }
@@ -713,7 +689,7 @@ unsafe extern "C" fn node_entry() {
 }
 
 fn init_node_stacks(g: &mut ProcessGraph) {
-    for i in 0..g.count {
+    for i in 0..g.count() {
         let entry = if g.nodes[i].id == 0 {
             shell::shell_main as *const () as u64
         } else {
@@ -733,11 +709,7 @@ fn init_node_stacks_for_with_entry(node: &mut ProcessNode, entry: u64) {
     let data_sel = 0x23u64;
     let rflags = 0x202u64;
     let base = node.stack.as_mut_ptr().add(STACK_SIZE - 160) as *mut u64;
-    let stack_rsp = if node.cr3 != 0 {
-        paging::PROCESS_STACK_TOP
-    } else {
-        0x2000 + (node.id as u64) * 0x1000
-    };
+    let stack_rsp = base as u64;
     for j in 0..15 {
         base.add(j).write(0);
     }
@@ -758,29 +730,6 @@ unsafe extern "C" fn kmain() -> ! {
     allocator::init();
     serial_init();
     vga::init();
-
-    let hhdm = HHDM_REQUEST
-        .get_response()
-        .and_then(|r| r.get())
-        .map(|r| r.offset())
-        .unwrap_or(0xffff_8000_0000_0000);
-    let mut frame_region_base = 0x400000u64;
-    let mut frame_region_len = 4 * 1024 * 1024u64;
-    if let Some(memmap) = MEMORY_MAP_REQUEST.get_response().and_then(|r| r.get()) {
-        for entry in memmap.entries() {
-            if entry.typ == limine::memory_map::Type::Usable && entry.len >= 6 * 1024 * 1024 {
-                frame_region_base = entry.base;
-                frame_region_len = entry.len;
-                break;
-            }
-        }
-    }
-    paging::init(hhdm);
-    paging::init_frame_allocator(frame_region_base, frame_region_len);
-    if paging::map_user_space() {
-        console_write("Paging: user space 0-2MiB mapped (U=1)\r\n");
-    }
-
     fs::init();
     let mut restored = false;
     if persist::try_restore() {

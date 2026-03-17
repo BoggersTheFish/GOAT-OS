@@ -1,10 +1,7 @@
-/* Timer and syscall interrupt stubs for TS-OS */
-/* Strongest Node scheduler context switching */
-
+/* Timer interrupt stub - saves all GPRs, calls timer_handler, restores or switches */
 .text
 .global timer_stub
 .global syscall_stub
-
 .extern timer_handler
 .extern syscall_handler
 
@@ -24,15 +21,12 @@ timer_stub:
     push %r13
     push %r14
     push %r15
-
     mov %rsp, %rdi
     call timer_handler
-
     cmp $0, %rax
-    jz .no_switch_timer
+    jz .no_switch
     mov %rax, %rsp
-
-.no_switch_timer:
+.no_switch:
     pop %r15
     pop %r14
     pop %r13
@@ -66,15 +60,12 @@ syscall_stub:
     push %r13
     push %r14
     push %r15
-
     mov %rsp, %rdi
     call syscall_handler
-
     cmp $0, %rax
-    jz .no_switch_syscall
+    jz .no_switch
     mov %rax, %rsp
-
-.no_switch_syscall:
+.no_switch:
     pop %r15
     pop %r14
     pop %r13
