@@ -36,6 +36,14 @@ SECTIONS
         *(COMMON)
     } :data
 
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    .persist (NOLOAD) : {
+        . = ALIGN(4096);
+        _persist_start = .;
+        . += 65536;
+        _persist_end = .;
+    } :data
+
     /DISCARD/ : {
         *(.eh_frame*)
         *(.note .note.*)

@@ -14,6 +14,7 @@ const SYS_PS: u64 = 8;
 const SYS_TOUCH: u64 = 9;
 const SYS_MKDIR: u64 = 10;
 const SYS_WRITE_F: u64 = 11;
+const SYS_SHUTDOWN: u64 = 12;
 
 fn syscall0(n: u64) -> u64 {
     let ret: u64;
@@ -173,12 +174,13 @@ pub fn shell_main() {
 
         match args[0] {
             "help" => {
-                do_write("help  - show this\r\n");
-                do_write("ps    - list processes\r\n");
-                do_write("echo  - echo text\r\n");
-                do_write("spawn - spawn new process\r\n");
-                do_write("ls    - list directory\r\n");
-                do_write("cat   - read file\r\n");
+                do_write("help     - show this\r\n");
+                do_write("ps       - list processes\r\n");
+                do_write("echo     - echo text\r\n");
+                do_write("spawn    - spawn new process\r\n");
+                do_write("ls       - list directory\r\n");
+                do_write("cat      - read file\r\n");
+                do_write("shutdown - checkpoint and halt\r\n");
             }
             "ps" => {
                 let n = do_ps(&mut out_buf);
@@ -243,6 +245,12 @@ pub fn shell_main() {
                 }
             }
             "exit" => do_exit(0),
+            "shutdown" => {
+                syscall0(SYS_SHUTDOWN);
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
             _ => {
                 do_write("unknown: ");
                 do_write(args[0]);

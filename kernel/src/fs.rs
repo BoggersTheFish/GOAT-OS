@@ -234,3 +234,42 @@ pub fn list_dir(path: &str) -> Vec<String> {
 pub fn cat(path: &str) -> Option<String> {
     read_file(path).and_then(|d| String::from_utf8(d).ok())
 }
+
+pub fn serialize_to(buf: &mut [u8]) -> usize {
+    unsafe {
+        let hdr_size = 8;
+        if buf.len() < hdr_size + NODE_COUNT * core::mem::size_of::<FsNode>() {
+            return 0;
+        }
+        *(buf.as_mut_ptr() as *mut usize) = NODE_COUNT;
+        let data = core::slice::from_raw_parts(
+            NODES.as_ptr() as *const u8,
+            NODE_COUNT * core::mem::size_of::<FsNode>(),
+        );
+        buf[hdr_size..hdr_size + data.len()].copy_from_slice(data);
+        hdr_size + data.len()
+    }
+}
+
+pub fn deserialize_from(buf: &[u8]) -> bool {
+    unsafe {
+        if buf.len() < 8 {
+            return false;
+        }
+        let count = *(buf.as_ptr() as *const usize);
+        if count > MAX_NODES || buf.len() < 8 + count * core::mem::size_of::<FsNode>() {
+            return false;
+        }
+        NODE_COUNT = count;
+        let data = core::slice::from_raw_parts(
+            buf.as_ptr().add(8),
+            count * core::mem::size_of::<FsNode>(),
+        );
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            NODES.as_mut_ptr() as *mut u8,
+            data.len(),
+        );
+        true
+    }
+}

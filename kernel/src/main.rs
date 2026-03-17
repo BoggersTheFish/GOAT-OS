@@ -13,6 +13,8 @@ extern crate alloc;
 mod allocator;
 mod fs;
 mod keyboard;
+mod paging;
+mod persist;
 mod shell;
 mod vga;
 
@@ -20,7 +22,7 @@ use core::alloc::Layout;
 use core::arch::asm;
 use core::mem::MaybeUninit;
 
-use limine::request::{RequestsEndMarker, RequestsStartMarker};
+use limine::request::{HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::idt::InterruptDescriptorTable;
@@ -31,6 +33,14 @@ use x86_64::VirtAddr;
 #[used]
 #[unsafe(link_section = ".requests")]
 static BASE_REVISION: BaseRevision = BaseRevision::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -52,7 +62,7 @@ const PIC1_DATA: u16 = 0x21;
 const PIC2_CMD: u16 = 0xA0;
 const PIC2_DATA: u16 = 0xA1;
 
-const MAX_NODES: usize = 8;
+const MAX_NODES: usize = 32;
 const MAX_NEIGHBORS: usize = 4;
 const NEIGHBOR_NONE: u8 = 0xFF;
 const STACK_SIZE: usize = 4096;
@@ -145,6 +155,7 @@ struct ProcessNode {
     stack: [u8; STACK_SIZE],
     saved_rip: u64,
     saved_rsp: u64,
+    cr3: u64,
 }
 
 impl ProcessNode {
@@ -158,6 +169,7 @@ impl ProcessNode {
             stack: [0u8; STACK_SIZE],
             saved_rip: 0,
             saved_rsp: 0,
+            cr3: 0,
         }
     }
 
@@ -167,24 +179,25 @@ impl ProcessNode {
 }
 
 struct ProcessGraph {
-    nodes: [ProcessNode; MAX_NODES],
-    count: usize,
+    nodes: alloc::vec::Vec<ProcessNode>,
 }
 
 impl ProcessGraph {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
-            nodes: [ProcessNode::empty(); MAX_NODES],
-            count: 0,
+            nodes: alloc::vec::Vec::new(),
         }
     }
 
+    fn count(&self) -> usize {
+        self.nodes.len()
+    }
+
     fn add_node(&mut self, id: u32, activation: u32, tension: u32, neighbors: &[u8]) -> bool {
-        if self.count >= MAX_NODES {
+        if self.nodes.len() >= MAX_NODES {
             return false;
         }
-        let i = self.count;
-        self.nodes[i] = ProcessNode {
+        self.nodes.push(ProcessNode {
             id,
             activation,
             tension,
@@ -199,13 +212,13 @@ impl ProcessGraph {
             stack: [0u8; STACK_SIZE],
             saved_rip: 0,
             saved_rsp: 0,
-        };
-        self.count += 1;
+            cr3: 0,
+        });
         true
     }
 
     fn decay_all(&mut self, except: usize) {
-        for i in 0..self.count {
+        for i in 0..self.nodes.len() {
             if i != except {
                 self.nodes[i].activation = self.nodes[i].activation.saturating_sub(2);
             }
@@ -219,7 +232,7 @@ impl ProcessGraph {
                 break;
             }
             let i = idx as usize;
-            if i < self.count && i != from {
+            if i < self.nodes.len() && i != from {
                 self.nodes[i].activation = self.nodes[i].activation.saturating_add(SPREAD);
                 if self.nodes[i].activation > 200 {
                     self.nodes[i].activation = 200;
@@ -229,12 +242,12 @@ impl ProcessGraph {
     }
 
     fn select_strongest(&self) -> Option<usize> {
-        if self.count == 0 {
+        if self.nodes.is_empty() {
             return None;
         }
         let mut best = None;
         let mut best_s = i32::MIN;
-        for i in 0..self.count {
+        for i in 0..self.nodes.len() {
             if matches!(self.nodes[i].state, NodeState::Exited) {
                 continue;
             }
@@ -248,16 +261,20 @@ impl ProcessGraph {
     }
 
     fn try_add_node(&mut self, id: u32, activation: u32, tension: u32, neighbors: &[u8]) -> Option<usize> {
-        if self.count >= MAX_NODES {
+        if self.nodes.len() >= MAX_NODES {
             return None;
         }
-        let i = self.count;
+        let i = self.nodes.len();
         self.add_node(id, activation, tension, neighbors);
         Some(i)
     }
 }
 
-static mut GRAPH: ProcessGraph = ProcessGraph::new();
+static mut GRAPH: Option<ProcessGraph> = None;
+
+fn graph() -> &'static mut ProcessGraph {
+    unsafe { GRAPH.as_mut().unwrap() }
+}
 
 fn small_delay() {
     for _ in 0..1000 {
@@ -353,7 +370,7 @@ unsafe extern "C" fn yield_to_kernel() {
     if idx == 0xFF {
         return;
     }
-    let node = &mut GRAPH.nodes[idx];
+    let node = &mut graph().nodes[idx];
     let rsp: u64;
     let rip: u64;
     asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags));
@@ -374,41 +391,55 @@ const SYS_PS: u64 = 8;
 const SYS_TOUCH: u64 = 9;
 const SYS_MKDIR: u64 = 10;
 const SYS_WRITE_F: u64 = 11;
+const SYS_SHUTDOWN: u64 = 12;
+
+fn do_checkpoint() {
+    let mut graph_buf = [0u8; 64];
+    graph_buf[0] = graph().count() as u8;
+    let mut fs_buf = [0u8; 16384];
+    let fs_len = fs::serialize_to(&mut fs_buf);
+    persist::do_checkpoint(graph_buf.as_ptr(), 64, fs_buf.as_ptr(), fs_len);
+}
 
 fn maybe_emerge_node() {
     let mut max_tension = 0u32;
-    for i in 0..GRAPH.count {
-        if !matches!(GRAPH.nodes[i].state, NodeState::Exited) {
-            max_tension = max_tension.max(GRAPH.nodes[i].tension);
+    for i in 0..graph().count() {
+        if !matches!(graph().nodes[i].state, NodeState::Exited) {
+            max_tension = max_tension.max(graph().nodes[i].tension);
         }
     }
-    if max_tension > 30 && GRAPH.count < MAX_NODES {
-        let next_id = GRAPH.count as u32;
-        if GRAPH.try_add_node(next_id, 50, 0, &[]).is_some() {
-            let idx = GRAPH.count - 1;
-            init_node_stacks_for(&mut GRAPH.nodes[idx]);
-            GRAPH.nodes[idx].state = NodeState::Ready;
+    if max_tension > 30 && graph().count() < MAX_NODES {
+        let next_id = graph().count() as u32;
+        if let Some(idx) = graph().try_add_node(next_id, 50, 0, &[]) {
+            if let Some(cr3) = paging::create_process_page_tables() {
+                graph().nodes[idx].cr3 = cr3;
+            }
+            init_node_stacks_for(&mut graph().nodes[idx]);
+            graph().nodes[idx].state = NodeState::Ready;
         }
     }
 }
 
 fn do_schedule(cur: Option<usize>) -> u64 {
     maybe_emerge_node();
-    let current = GRAPH.select_strongest();
+    let current = graph().select_strongest();
     if let Some(c) = current {
-        GRAPH.decay_all(c);
-        GRAPH.spread_from(c);
+        graph().decay_all(c);
+        graph().spread_from(c);
     }
-    let new_strongest = GRAPH.select_strongest();
+    let new_strongest = graph().select_strongest();
     if let Some(ns) = new_strongest {
-        GRAPH.nodes[ns].state = NodeState::Running;
+        graph().nodes[ns].state = NodeState::Running;
         let do_switch = cur != Some(ns) || cur.is_none();
         if do_switch {
             CURRENT_NODE_IDX = ns;
-            if GRAPH.nodes[ns].saved_rsp != 0 {
-                return GRAPH.nodes[ns].saved_rsp;
+            if graph().nodes[ns].cr3 != 0 {
+                paging::switch_cr3(graph().nodes[ns].cr3);
             }
-            return GRAPH.nodes[ns].stack.as_ptr().add(STACK_SIZE - 160) as u64;
+            if graph().nodes[ns].saved_rsp != 0 {
+                return graph().nodes[ns].saved_rsp;
+            }
+            return graph().nodes[ns].stack.as_ptr().add(STACK_SIZE - 160) as u64;
         }
     }
     0
@@ -447,7 +478,7 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
         }
         SYS_YIELD => {
             if CURRENT_NODE_IDX != 0xFF {
-                GRAPH.nodes[CURRENT_NODE_IDX].saved_rsp = frame_ptr as u64;
+                graph().nodes[CURRENT_NODE_IDX].saved_rsp = frame_ptr as u64;
             }
             let cur = if CURRENT_NODE_IDX != 0xFF {
                 Some(CURRENT_NODE_IDX)
@@ -457,11 +488,14 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             do_schedule(cur)
         }
         SYS_SPAWN => {
-            let next_id = GRAPH.count as u32;
+            let next_id = graph().count() as u32;
             let frame_mut = frame_ptr as *mut u64;
-            if let Some(idx) = GRAPH.try_add_node(next_id, 50, 0, &[]) {
-                init_node_stacks_for(&mut GRAPH.nodes[idx]);
-                GRAPH.nodes[idx].state = NodeState::Ready;
+            if let Some(idx) = graph().try_add_node(next_id, 50, 0, &[]) {
+                if let Some(cr3) = paging::create_process_page_tables() {
+                    graph().nodes[idx].cr3 = cr3;
+                }
+                init_node_stacks_for(&mut graph().nodes[idx]);
+                graph().nodes[idx].state = NodeState::Ready;
                 *frame_mut.add(0) = idx as u64;
             } else {
                 *frame_mut.add(0) = !0u64;
@@ -471,8 +505,8 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
         SYS_EXIT => {
             let _status = *frame.add(5);
             if CURRENT_NODE_IDX != 0xFF {
-                GRAPH.nodes[CURRENT_NODE_IDX].state = NodeState::Exited;
-                GRAPH.nodes[CURRENT_NODE_IDX].saved_rsp = frame_ptr as u64;
+                graph().nodes[CURRENT_NODE_IDX].state = NodeState::Exited;
+                graph().nodes[CURRENT_NODE_IDX].saved_rsp = frame_ptr as u64;
             }
             let cur = if CURRENT_NODE_IDX != 0xFF {
                 Some(CURRENT_NODE_IDX)
@@ -533,8 +567,8 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             let out_ptr = *frame.add(5) as *mut u8;
             let out_len = *frame.add(4) as usize;
             let mut s = alloc::format!("pid  act  ten  state\r\n");
-            for i in 0..GRAPH.count {
-                let n = &GRAPH.nodes[i];
+            for i in 0..graph().count() {
+                let n = &graph().nodes[i];
                 let st = match n.state {
                     NodeState::Ready => "R",
                     NodeState::Running => "X",
@@ -591,6 +625,13 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             *(frame_ptr as *mut u64) = fs::write_file(path, data) as u64;
             0
         }
+        SYS_SHUTDOWN => {
+            do_checkpoint();
+            console_write("Checkpoint saved. Halting.\r\n");
+            loop {
+                asm!("hlt");
+            }
+        }
         _ => !0u64,
     }
 }
@@ -600,6 +641,9 @@ pub unsafe extern "C" fn timer_handler(frame_ptr: *mut u8) -> u64 {
     outb(PIC1_CMD, 0x20);
 
     TICK_COUNT += 1;
+    if TICK_COUNT % 3000 == 0 && TICK_COUNT > 0 {
+        do_checkpoint();
+    }
 
     let cur = if CURRENT_NODE_IDX != 0xFF {
         Some(CURRENT_NODE_IDX)
@@ -608,29 +652,32 @@ pub unsafe extern "C" fn timer_handler(frame_ptr: *mut u8) -> u64 {
     };
 
     if let Some(idx) = cur {
-        GRAPH.nodes[idx].saved_rsp = frame_ptr as u64;
-        GRAPH.nodes[idx].tension = GRAPH.nodes[idx].tension.saturating_add(1);
+        graph().nodes[idx].saved_rsp = frame_ptr as u64;
+        graph().nodes[idx].tension = graph().nodes[idx].tension.saturating_add(1);
     } else {
         KERNEL_RSP = frame_ptr as u64 + 120;
     }
 
     maybe_emerge_node();
-    let current = GRAPH.select_strongest();
+    let current = graph().select_strongest();
     if let Some(c) = current {
-        GRAPH.decay_all(c);
-        GRAPH.spread_from(c);
+        graph().decay_all(c);
+        graph().spread_from(c);
     }
 
-    let new_strongest = GRAPH.select_strongest();
+    let new_strongest = graph().select_strongest();
     if let Some(ns) = new_strongest {
-        GRAPH.nodes[ns].state = NodeState::Running;
+        graph().nodes[ns].state = NodeState::Running;
         let do_switch = cur != Some(ns) || cur.is_none();
         if do_switch {
             CURRENT_NODE_IDX = ns;
-            if GRAPH.nodes[ns].saved_rsp != 0 {
-                return GRAPH.nodes[ns].saved_rsp;
+            if graph().nodes[ns].cr3 != 0 {
+                paging::switch_cr3(graph().nodes[ns].cr3);
             }
-            return GRAPH.nodes[ns].stack.as_ptr().add(STACK_SIZE - 160) as u64;
+            if graph().nodes[ns].saved_rsp != 0 {
+                return graph().nodes[ns].saved_rsp;
+            }
+            return graph().nodes[ns].stack.as_ptr().add(STACK_SIZE - 160) as u64;
         }
     }
 
@@ -644,8 +691,8 @@ unsafe extern "C" fn node_entry() {
         if idx == 0xFF {
             break;
         }
-        let node_id = GRAPH.nodes[idx].id;
-        let act = GRAPH.nodes[idx].activation;
+        let node_id = graph().nodes[idx].id;
+        let act = graph().nodes[idx].activation;
         match node_id {
             0 => {
                 do_sys_write(b"Node 0 stats: act=");
@@ -686,14 +733,18 @@ fn init_node_stacks_for_with_entry(node: &mut ProcessNode, entry: u64) {
     let data_sel = 0x23u64;
     let rflags = 0x202u64;
     let base = node.stack.as_mut_ptr().add(STACK_SIZE - 160) as *mut u64;
-    let base_addr = base as u64;
+    let stack_rsp = if node.cr3 != 0 {
+        paging::PROCESS_STACK_TOP
+    } else {
+        0x2000 + (node.id as u64) * 0x1000
+    };
     for j in 0..15 {
         base.add(j).write(0);
     }
     base.add(15).write(entry);
     base.add(16).write(code_sel);
     base.add(17).write(rflags);
-    base.add(18).write(base_addr);
+    base.add(18).write(stack_rsp);
     base.add(19).write(data_sel);
 }
 
@@ -707,10 +758,44 @@ unsafe extern "C" fn kmain() -> ! {
     allocator::init();
     serial_init();
     vga::init();
+
+    let hhdm = HHDM_REQUEST
+        .get_response()
+        .and_then(|r| r.get())
+        .map(|r| r.offset())
+        .unwrap_or(0xffff_8000_0000_0000);
+    let mut frame_region_base = 0x400000u64;
+    let mut frame_region_len = 4 * 1024 * 1024u64;
+    if let Some(memmap) = MEMORY_MAP_REQUEST.get_response().and_then(|r| r.get()) {
+        for entry in memmap.entries() {
+            if entry.typ == limine::memory_map::Type::Usable && entry.len >= 6 * 1024 * 1024 {
+                frame_region_base = entry.base;
+                frame_region_len = entry.len;
+                break;
+            }
+        }
+    }
+    paging::init(hhdm);
+    paging::init_frame_allocator(frame_region_base, frame_region_len);
+    if paging::map_user_space() {
+        console_write("Paging: user space 0-2MiB mapped (U=1)\r\n");
+    }
+
     fs::init();
-    fs::mkdir("/tmp");
-    fs::touch("/readme.txt");
-    fs::write_file("/readme.txt", b"TS-OS - Strongest Node Framework. Type 'help' in shell.\r\n");
+    let mut restored = false;
+    if persist::try_restore() {
+        let mut fs_buf = [0u8; 16384];
+        let n = persist::restore_fs(fs_buf.as_mut_ptr(), fs_buf.len());
+        if n > 0 && fs::deserialize_from(&fs_buf[..n]) {
+            restored = true;
+            console_write("Restored filesystem from checkpoint\r\n");
+        }
+    }
+    if !restored {
+        fs::mkdir("/tmp");
+        fs::touch("/readme.txt");
+        fs::write_file("/readme.txt", b"TS-OS - Strongest Node Framework. Type 'help' in shell.\r\n");
+    }
     console_write("TS-OS Strongest Node online\r\n");
 
     let mut gdt = GlobalDescriptorTable::new();
@@ -741,7 +826,8 @@ unsafe extern "C" fn kmain() -> ! {
     pic_remap();
     pit_init();
 
-    let g = &mut GRAPH;
+    unsafe { GRAPH = Some(ProcessGraph::new()) };
+    let g = graph();
     g.add_node(0, 100, 0, &[1, 3]);
     g.add_node(1, 80, 10, &[0, 2]);
     g.add_node(2, 60, 5, &[1, 3]);

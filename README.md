@@ -10,47 +10,45 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 
 | Component | Status |
 |-----------|--------|
-| **Strongest Node** | Full usable TS-OS (kernel + scheduler, activation 100, tension 0) |
-| **Secondary nodes** | 5 static + dynamic emergence when tension > 30 |
-| **User mode** | Ring 3 via GDT user segments, iretq, syscall DPL=3 |
-| **Heap** | Linked-list allocator with free (128 KiB) |
-| **Syscalls** | write, yield, spawn, read, exit, ls, cat, ps, touch, mkdir, write_f |
-| **Drivers** | VGA text (0xB8000), PS/2 keyboard, serial (COM1) |
-| **Filesystem** | In-RAM tree (nodes as files/directories) |
-| **Shell** | User-mode shell (help, ps, echo, spawn, ls, cat, touch, mkdir, exit) |
+| **Strongest Node** | Robust TS-OS (activation 100, tension 8) |
+| **Paging** | 4-level, identity map kernel, user 0–2 MiB (U=1) |
+| **Heap** | Linked-list with coalescing + defrag (frag > 30%) |
+| **Keyboard** | Shift, caps lock, 128-byte circular buffer |
+| **Persistence** | Checkpoint graph+fs every 30s, restore on boot |
+| **Process graph** | Vec-based, up to 32 nodes, dynamic emergence |
+| **Process isolation** | Per-process page directory, CR3 switch on schedule |
 
-### Node Table (Initial)
+### Node Table (Example)
 
-| Node | id | activation | tension | role |
-|------|-----|------------|---------|------|
-| 0 | 0 | 100 | 0 | Shell |
-| 1 | 1 | 80 | 10 | Worker |
-| 2 | 2 | 60 | 5 | Worker |
-| 3 | 3 | 40 | 20 | Worker |
-| 4 | 4 | 80 | 0 | Worker |
+| Node | id | activation | tension | cr3 |
+|------|-----|------------|---------|-----|
+| 0 | 0 | 100 | 0 | 0 (shared) |
+| 1 | 1 | 80 | 10 | 0 |
+| 2 | 2 | 60 | 5 | 0 |
+| 5 | 5 | 50 | 0 | per-process |
 
-**Tensions resolved:** Ring 3, heap free, syscalls, VGA, keyboard, filesystem, shell  
-**Tensions remaining:** No paging (identity map; ring 3 may fault on some hardware), no coalescing in allocator, keyboard scancode set 1 only  
-**Coherence delta:** +7 (full iteration complete)
+**Tensions resolved:** No paging, no coalescing, basic keyboard, no persistence, fixed 8 nodes, no isolation  
+**Tensions remaining:** Persistence is in-RAM (lost on power cycle), no disk, shell still minimal  
+**Coherence delta:** +6 (full iteration)
 
 ---
 
 ## Implemented Features
 
 ### Core
-- **Boot with Limine** – x86_64 bare-metal boot (BIOS + UEFI)
-- **Linked-list heap** – 128 KiB, GlobalAlloc with alloc + dealloc, first-fit, block splitting
-- **GDT + TSS** – Kernel + user code/data segments, TSS with kernel stack for interrupts
-- **Ring 3 user mode** – User CS (0x1b), user SS (0x23), iretq to user code
-- **Syscall interface (INT 0x80)** – DPL=3 so user can invoke
+- **Boot with Limine** – x86_64 bare-metal (BIOS + UEFI)
+- **4-level paging** – Identity map kernel, user 0–2 MiB (U=1), per-process page dirs
+- **Linked-list heap** – 128 KiB, coalescing on free, defrag when frag > 30%
+- **GDT + TSS** – Kernel + user segments, TSS for kernel stack
+- **Ring 3 user mode** – User CS/SS, iretq, syscall DPL=3
 
 ### Syscalls
 | # | Name | Description |
 |---|------|-------------|
-| 1 | write | Write to fd 1 (stdout → VGA + serial) |
+| 1 | write | stdout → VGA + serial |
 | 2 | yield | Yield to scheduler |
-| 3 | spawn | Spawn new process node |
-| 4 | read | Read from fd 0 (stdin → keyboard) |
+| 3 | spawn | Spawn process (own page dir) |
+| 4 | read | stdin from keyboard |
 | 5 | exit | Exit process |
 | 6 | ls | List directory |
 | 7 | cat | Read file |
@@ -58,54 +56,44 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 | 9 | touch | Create file |
 | 10 | mkdir | Create directory |
 | 11 | write_f | Write to file |
+| 12 | shutdown | Checkpoint and halt |
 
 ### Scheduler
-- **Strongest Node** – Select by `activation - tension`
-- **Spreading activation** – Running node spreads +10 to neighbors
-- **Decay** – Inactive nodes lose 2 activation per tick
-- **Tension bump** – Preempted node gains +1 tension
-- **Dynamic emergence** – When max tension > 30, spawn new node (if room)
+- **Strongest Node** – activation − tension
+- **Spreading activation** – +10 to neighbors
+- **Decay** – −2 activation per tick
+- **Tension bump** – +1 on preempt
+- **Dynamic emergence** – Spawn when max tension > 30 (up to 32 nodes)
 
 ### Drivers
-- **VGA text** – 80×25, 0xB8000, scroll on newline
-- **PS/2 keyboard** – Ports 0x60/0x64, scancode set 1 → ASCII
-- **Serial** – COM1 (0x3F8) for debug
+- **VGA text** – 80×25, scroll
+- **PS/2 keyboard** – Shift, caps lock, 128-byte ring buffer
+- **Serial** – COM1
 
 ### Filesystem
-- **In-RAM tree** – Nodes as files/directories
-- **Operations** – mkdir, touch, read_file, write_file, list_dir
-- **Paths** – Unix-style (/path/to/file)
+- **In-RAM tree** – mkdir, touch, read, write, list
+- **Persistence** – Serialize to reserved region every 30s, on shutdown; restore on boot
 
-### Shell (User Mode)
-- **Commands:** help, ps, echo, spawn, ls, cat, touch, mkdir, exit
-- **Echo to file:** `echo "text" > path`
-- **Runs as node 0** – First scheduled process
+### Process Isolation
+- **Per-process page directory** – Spawned processes get own CR3
+- **User stack** – Mapped at 0x1000–0x2000 per process
 
 ---
 
 ## Build & Run
 
 ### Requirements
-- **Rust** (nightly): `rustup default nightly`
-- **GNU Make** (MSYS2, WSL, or MinGW on Windows)
-- **xorriso** (for ISO generation)
-- **QEMU** (optional)
+- Rust (nightly)
+- GNU Make, xorriso, QEMU (optional)
 
 ### Build
 ```bash
 make all
 ```
-Produces `ts-os-x86_64.iso`.
 
-### Run in QEMU
+### Run
 ```bash
 make run
-```
-VGA appears in QEMU window; serial in terminal (`-serial stdio`).
-
-### UEFI
-```bash
-make run-uefi
 ```
 
 ---
@@ -114,21 +102,16 @@ make run-uefi
 
 ```
 BoggersTheOS/
-├── .cursorrules.txt
-├── GNUmakefile
-├── limine.conf
-├── kernel/
-│   ├── Cargo.toml
-│   ├── build.rs
-│   ├── linker-x86_64.ld
-│   └── src/
-│       ├── main.rs      # Kernel entry, scheduler, syscalls
-│       ├── allocator.rs # Linked-list heap
-│       ├── vga.rs       # VGA text driver
-│       ├── keyboard.rs # PS/2 keyboard
-│       ├── fs.rs        # In-RAM filesystem
-│       ├── shell.rs     # User-mode shell
-│       └── idt.S        # Timer + syscall stubs
+├── kernel/src/
+│   ├── main.rs      # Kernel, scheduler, syscalls
+│   ├── allocator.rs # Heap + coalescing + defrag
+│   ├── paging.rs    # 4-level paging, per-process CR3
+│   ├── vga.rs
+│   ├── keyboard.rs  # Shift, caps, ring buffer
+│   ├── fs.rs
+│   ├── persist.rs   # Checkpoint/restore
+│   ├── shell.rs
+│   └── idt.S
 └── README.md
 ```
 
@@ -136,22 +119,43 @@ BoggersTheOS/
 
 ## Honest Limitations
 
-- **No paging** – Identity mapping from bootloader; ring 3 may fault if pages lack user bit
-- **No coalescing** – Free blocks not merged; fragmentation possible
-- **Fixed node cap** – MAX_NODES=8; graph is static array
-- **Keyboard** – US QWERTY scancode set 1 only; no shift/caps
-- **Filesystem** – In-RAM only; lost on reboot
+- **Persistence** – In-RAM only; lost on power cycle
 - **No disk** – No persistent storage
-- **Single address space** – No process isolation
+- **Keyboard** – US QWERTY scancode set 1 only
+- **No coalescing** – Defrag merges adjacent free blocks only; no moving allocated blocks
+- **Process isolation** – Per-process address space; kernel still shared
+- **Shell** – Minimal
 
 ---
 
-## Roadmap
+## Current Capabilities
 
-1. **Paging** – User-accessible pages for reliable ring 3
-2. **Heap coalescing** – Merge adjacent free blocks
-3. **Dynamic graph** – Heap-allocated ProcessGraph, grow beyond 8 nodes
-4. **Process isolation** – Per-process address spaces
+- Boots on real hardware / QEMU
+- User-mode shell with help, ps, echo, spawn, ls, cat, touch, mkdir, shutdown
+- Dynamic process creation (up to 32)
+- Per-process page tables for spawned processes
+- Checkpoint/restore of fs (and graph count) every 30s and on shutdown
+- VGA + serial output, keyboard input
+- Strongest Node scheduler with emergence
+
+---
+
+## Remaining Work
+
+1. **Disk persistence** – Write checkpoint to disk
+2. **Full heap defrag** – Move allocated blocks
+3. **More shell commands** – cd, pwd, rm
+4. **Syscall validation** – Bounds-check user pointers
+
+---
+
+## Philosophy & Design Principles
+
+- **Strongest Node drives everything** – Kernel is core; all else emerges
+- **Secondary nodes = processes** – Process graph with activation, tension, neighbors
+- **Emergence** – Nodes spawn when tension high
+- **Tension resolution** – Bugs, inefficiency, bloat are tensions
+- **Coherence rollback** – Every change triggers coherence check
 
 ---
 
