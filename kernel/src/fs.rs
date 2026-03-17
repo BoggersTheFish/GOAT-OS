@@ -1,5 +1,6 @@
 //! In-RAM filesystem (nodes as files/directories)
 
+use alloc::string::ToString;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -15,6 +16,7 @@ pub enum FsNodeKind {
     Dir,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FsNode {
     pub kind: FsNodeKind,
@@ -46,7 +48,7 @@ impl FsNode {
     }
 }
 
-static mut NODES: [FsNode; MAX_NODES] = [FsNode::empty(); MAX_NODES];
+static mut NODES: [FsNode; MAX_NODES] = [const { FsNode::empty() }; MAX_NODES];
 static mut NODE_COUNT: usize = 0;
 
 fn name_to_arr(s: &str) -> [u8; MAX_NAME] {
@@ -122,7 +124,10 @@ pub fn mkdir(path: &str) -> bool {
                     return false;
                 }
             } else if i == parts.len() - 1 {
-                let new_idx = alloc_node().ok_or(()).unwrap_or(return false);
+                let new_idx = match alloc_node() {
+                    Some(x) => x,
+                    None => return false,
+                };
                 NODES[new_idx].kind = FsNodeKind::Dir;
                 NODES[new_idx].name = name_to_arr(part);
                 if add_child(cur, new_idx) {
@@ -163,7 +168,10 @@ pub fn touch(path: &str) -> bool {
         if find_child(cur, file_name).is_some() {
             return true;
         }
-        let new_idx = alloc_node().ok_or(()).unwrap_or(return false);
+        let new_idx = match alloc_node() {
+            Some(x) => x,
+            None => return false,
+        };
         NODES[new_idx].kind = FsNodeKind::File;
         NODES[new_idx].name = name_to_arr(file_name);
         add_child(cur, new_idx)
@@ -197,17 +205,15 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
 }
 
 fn resolve(path: &str) -> Option<usize> {
-    unsafe {
-        let parts: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
-        if parts.is_empty() {
-            return Some(0);
-        }
-        let mut cur = 0;
-        for part in &parts {
-            cur = find_child(cur, part)?;
-        }
-        Some(cur)
+    let parts: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return Some(0);
     }
+    let mut cur = 0;
+    for part in &parts {
+        cur = find_child(cur, part)?;
+    }
+    Some(cur)
 }
 
 pub fn list_dir(path: &str) -> Vec<String> {

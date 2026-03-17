@@ -7,6 +7,7 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+#![allow(dead_code, static_mut_refs)]
 
 extern crate alloc;
 
@@ -17,6 +18,7 @@ mod persist;
 mod shell;
 mod vga;
 
+use alloc::string::ToString;
 use core::alloc::Layout;
 use core::arch::asm;
 use core::mem::MaybeUninit;
@@ -64,6 +66,92 @@ const KERNEL_STACK_SIZE: usize = 4096;
 static mut KERNEL_RSP: u64 = 0;
 static mut CURRENT_NODE_IDX: usize = 0xFF;
 static mut TICK_COUNT: u32 = 0;
+
+core::arch::global_asm!(
+    r#"
+    .text
+    .global timer_stub
+    .global syscall_stub
+
+timer_stub:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rdi, rsp
+    call timer_handler
+    cmp rax, 0
+    jz .no_switch_timer
+    mov rsp, rax
+.no_switch_timer:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
+
+syscall_stub:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rdi, rsp
+    call syscall_handler
+    cmp rax, 0
+    jz .no_switch_syscall
+    mov rsp, rax
+.no_switch_syscall:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
+"#
+);
 
 extern "C" {
     fn timer_stub();
@@ -215,7 +303,8 @@ impl ProcessGraph {
 
     fn spread_from(&mut self, from: usize) {
         const SPREAD: u32 = 10;
-        for &idx in &self.nodes[from].neighbors {
+        let neighbors: [u8; MAX_NEIGHBORS] = self.nodes[from].neighbors;
+        for &idx in &neighbors {
             if idx == NEIGHBOR_NONE {
                 break;
             }
@@ -417,11 +506,11 @@ fn do_schedule(cur: Option<usize>) -> u64 {
         graph().nodes[ns].state = NodeState::Running;
         let do_switch = cur != Some(ns) || cur.is_none();
         if do_switch {
-            CURRENT_NODE_IDX = ns;
+            unsafe { CURRENT_NODE_IDX = ns };
             if graph().nodes[ns].saved_rsp != 0 {
                 return graph().nodes[ns].saved_rsp;
             }
-            return graph().nodes[ns].stack.as_ptr().add(STACK_SIZE - 160) as u64;
+            return unsafe { graph().nodes[ns].stack.as_ptr().add(STACK_SIZE - 160) as u64 };
         }
     }
     0
@@ -649,11 +738,11 @@ pub unsafe extern "C" fn timer_handler(frame_ptr: *mut u8) -> u64 {
         graph().nodes[ns].state = NodeState::Running;
         let do_switch = cur != Some(ns) || cur.is_none();
         if do_switch {
-            CURRENT_NODE_IDX = ns;
+            unsafe { CURRENT_NODE_IDX = ns };
             if graph().nodes[ns].saved_rsp != 0 {
                 return graph().nodes[ns].saved_rsp;
             }
-            return graph().nodes[ns].stack.as_ptr().add(STACK_SIZE - 160) as u64;
+            return unsafe { graph().nodes[ns].stack.as_ptr().add(STACK_SIZE - 160) as u64 };
         }
     }
 
@@ -708,16 +797,18 @@ fn init_node_stacks_for_with_entry(node: &mut ProcessNode, entry: u64) {
     let code_sel = 0x1bu64;
     let data_sel = 0x23u64;
     let rflags = 0x202u64;
-    let base = node.stack.as_mut_ptr().add(STACK_SIZE - 160) as *mut u64;
-    let stack_rsp = base as u64;
-    for j in 0..15 {
-        base.add(j).write(0);
+    unsafe {
+        let base = node.stack.as_mut_ptr().add(STACK_SIZE - 160) as *mut u64;
+        let stack_rsp = base as u64;
+        for j in 0..15 {
+            base.add(j).write(0);
+        }
+        base.add(15).write(entry);
+        base.add(16).write(code_sel);
+        base.add(17).write(rflags);
+        base.add(18).write(stack_rsp);
+        base.add(19).write(data_sel);
     }
-    base.add(15).write(entry);
-    base.add(16).write(code_sel);
-    base.add(17).write(rflags);
-    base.add(18).write(stack_rsp);
-    base.add(19).write(data_sel);
 }
 
 #[unsafe(no_mangle)]
@@ -748,28 +839,26 @@ unsafe extern "C" fn kmain() -> ! {
     console_write("TS-OS Strongest Node online\r\n");
 
     let mut gdt = GlobalDescriptorTable::new();
-    gdt.append(Descriptor::kernel_code_segment());
-    gdt.append(Descriptor::kernel_data_segment());
-    gdt.append(Descriptor::user_code_segment());
-    gdt.append(Descriptor::user_data_segment());
-    let tss = TSS.write(TaskStateSegment {
-        privilege_stack_table: [VirtAddr::zero(); 3],
-        interrupt_stack_table: [VirtAddr::zero(); 7],
-        iomap_base: 0,
-    });
+    gdt.add_entry(Descriptor::kernel_code_segment());
+    gdt.add_entry(Descriptor::kernel_data_segment());
+    gdt.add_entry(Descriptor::user_code_segment());
+    gdt.add_entry(Descriptor::user_data_segment());
+    let tss = TSS.write(TaskStateSegment::new());
     tss.privilege_stack_table[0] = VirtAddr::from_ptr(
         KERNEL_STACK.0.as_ptr().add(KERNEL_STACK_SIZE) as *const u8,
     );
-    let tss_sel = gdt.append(Descriptor::tss_segment(unsafe { TSS.assume_init_ref() }));
+    let tss_sel = gdt.add_entry(Descriptor::tss_segment(unsafe { TSS.assume_init_ref() }));
+    let gdt = alloc::boxed::Box::leak(alloc::boxed::Box::new(gdt));
     gdt.load();
     unsafe { x86_64::instructions::tables::load_tss(tss_sel) };
 
     let mut idt = InterruptDescriptorTable::new();
     unsafe {
-        idt[IRQ_TIMER as usize].set_handler_addr(VirtAddr::from_ptr(timer_stub));
-        let opt = idt[SYSCALL_VECTOR as usize].set_handler_addr(VirtAddr::from_ptr(syscall_stub));
+        idt[IRQ_TIMER as usize].set_handler_addr(VirtAddr::from_ptr(timer_stub as *const ()));
+        let opt = idt[SYSCALL_VECTOR as usize].set_handler_addr(VirtAddr::from_ptr(syscall_stub as *const ()));
         opt.set_privilege_level(PrivilegeLevel::Ring3);
     }
+    let idt = alloc::boxed::Box::leak(alloc::boxed::Box::new(idt));
     idt.load();
 
     pic_remap();
@@ -797,8 +886,6 @@ unsafe extern "C" fn kmain() -> ! {
     loop {
         asm!("hlt");
     }
-
-    hcf();
 }
 
 #[panic_handler]

@@ -1,6 +1,5 @@
 //! Minimal shell (runs in user mode via node 0)
 
-use alloc::string::String;
 use alloc::vec::Vec;
 
 const SYS_WRITE: u64 = 1;
@@ -132,7 +131,7 @@ fn parse_args(line: &str) -> Vec<&str> {
     line.split_whitespace().collect()
 }
 
-fn parse_echo_args(line: &str) -> Option<EchoResult> {
+fn parse_echo_args(line: &str) -> Option<EchoResult<'_>> {
     let rest = line.strip_prefix("echo")?;
     let rest = trim(rest);
     if let Some(idx) = rest.find('>') {
