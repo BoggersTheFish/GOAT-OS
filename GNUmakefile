@@ -27,6 +27,11 @@ run-debug: $(IMAGE_NAME).iso $(DISK_IMG)
 	qemu-system-$(KARCH) -M q35 -cdrom $(IMAGE_NAME).iso -boot d \
 		-drive file=$(DISK_IMG),format=raw,if=ide -m 2G -serial stdio -display gtk
 
+.PHONY: run-debug-log
+run-debug-log: $(IMAGE_NAME).iso $(DISK_IMG)
+	qemu-system-$(KARCH) -M q35 -cdrom $(IMAGE_NAME).iso -boot d \
+		-drive file=$(DISK_IMG),format=raw,if=ide -m 2G -serial file:debug-60b9db.log -display gtk
+
 .PHONY: run-uefi
 run-uefi: edk2-ovmf $(IMAGE_NAME).iso $(DISK_IMG)
 	qemu-system-$(KARCH) -M q35 \

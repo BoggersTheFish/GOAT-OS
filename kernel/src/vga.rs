@@ -169,6 +169,7 @@ pub fn init_framebuffer(addr: *mut u8, width: u64, height: u64, pitch: u64, bpp:
         FB_PITCH = pitch as usize;
         FB_BPP = bpp;
         VGA_ENABLED = true;
+        clear_full_screen();
         clear();
     }
 }
@@ -213,6 +214,17 @@ fn draw_char(c: u8, col: usize, row: usize) {
                 }
             }
         }
+    }
+}
+
+/// Clear entire framebuffer (removes bootloader artifacts).
+fn clear_full_screen() {
+    if !unsafe { VGA_ENABLED } || unsafe { FB_ADDR.is_null() } {
+        return;
+    }
+    let total_bytes = unsafe { FB_PITCH * FB_HEIGHT };
+    unsafe {
+        core::ptr::write_bytes(FB_ADDR, 0, total_bytes);
     }
 }
 

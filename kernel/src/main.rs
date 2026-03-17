@@ -84,6 +84,12 @@ core::arch::global_asm!(
     .text
     .global timer_stub
     .global syscall_stub
+    .global double_fault_stub
+
+double_fault_stub:
+    mov rdi, rsp
+    call double_fault_handler
+    ud2
 
 timer_stub:
     push rax
@@ -168,11 +174,27 @@ syscall_stub:
 extern "C" {
     fn timer_stub();
     fn syscall_stub();
+    fn double_fault_stub();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn double_fault_handler(_frame: *mut u8) -> ! {
+    serial_write("DF\r\n");
+    hcf();
 }
 
 #[repr(align(16))]
 struct KernelStack([u8; KERNEL_STACK_SIZE]);
 static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_SIZE]);
+
+#[repr(align(16))]
+struct DoubleFaultStack([u8; 4096]);
+static mut DOUBLE_FAULT_STACK: DoubleFaultStack = DoubleFaultStack([0; 4096]);
+
+#[repr(align(16))]
+struct TimerStack([u8; 4096]);
+static mut TIMER_STACK: TimerStack = TimerStack([0; 4096]);
+
 static mut TSS: MaybeUninit<TaskStateSegment> = MaybeUninit::uninit();
 
 #[global_allocator]
@@ -625,8 +647,8 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             }
             for i in 0..len {
                 let b = *buf.add(i);
-                outb(COM1, b);
                 vga::write_byte(b);
+                outb(COM1, b);
             }
             *(frame_ptr as *mut u64) = len as u64;
             0
@@ -1134,11 +1156,15 @@ unsafe extern "C" fn kmain() -> ! {
     }
     if let Some(fb_resp) = FRAMEBUFFER_REQUEST.get_response() {
         if let Some(fb) = fb_resp.framebuffers().next() {
-            let phys = fb.addr() as u64;
-            let addr = if let Some(hhdm) = HHDM_REQUEST.get_response() {
-                phys + hhdm.offset()
+            let base = fb.addr() as u64;
+            // Limine may return physical or already-mapped virtual address.
+            // If already in higher half (0xffff8000...), use as-is; else apply HHDM.
+            let addr = if base >= 0xffff_8000_0000_0000 {
+                base
+            } else if let Some(hhdm) = HHDM_REQUEST.get_response() {
+                base.wrapping_add(hhdm.offset())
             } else {
-                phys
+                base
             };
             vga::init_framebuffer(addr as *mut u8, fb.width(), fb.height(), fb.pitch(), fb.bpp());
         } else {
@@ -1173,6 +1199,12 @@ unsafe extern "C" fn kmain() -> ! {
     tss.privilege_stack_table[0] = VirtAddr::from_ptr(
         KERNEL_STACK.0.as_ptr().add(KERNEL_STACK_SIZE) as *const u8,
     );
+    tss.interrupt_stack_table[0] = VirtAddr::from_ptr(
+        DOUBLE_FAULT_STACK.0.as_ptr().add(4096) as *const u8,
+    );
+    tss.interrupt_stack_table[1] = VirtAddr::from_ptr(
+        TIMER_STACK.0.as_ptr().add(4096) as *const u8,
+    );
     let tss_sel = gdt.add_entry(Descriptor::tss_segment(unsafe { TSS.assume_init_ref() }));
     let gdt = alloc::boxed::Box::leak(alloc::boxed::Box::new(gdt));
     gdt.load();
@@ -1180,7 +1212,12 @@ unsafe extern "C" fn kmain() -> ! {
 
     let mut idt = InterruptDescriptorTable::new();
     unsafe {
-        idt[IRQ_TIMER as usize].set_handler_addr(VirtAddr::from_ptr(timer_stub as *const ()));
+        idt.double_fault
+            .set_handler_addr(VirtAddr::from_ptr(double_fault_stub as *const ()))
+            .set_stack_index(0);
+        idt[IRQ_TIMER as usize]
+            .set_handler_addr(VirtAddr::from_ptr(timer_stub as *const ()))
+            .set_stack_index(1);
         let opt = idt[SYSCALL_VECTOR as usize].set_handler_addr(VirtAddr::from_ptr(syscall_stub as *const ()));
         opt.set_privilege_level(PrivilegeLevel::Ring3);
     }

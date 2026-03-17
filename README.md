@@ -35,10 +35,10 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 ### Syscalls
 | # | Name | Description |
 |---|------|-------------|
-| 1 | write | stdout → VGA + serial |
+| 1 | write | stdout → VGA first, then serial |
 | 2 | yield | Yield to scheduler |
 | 3 | spawn | Spawn process |
-| 4 | read | stdin from keyboard/serial |
+| 4 | read | stdin from keyboard first, then serial |
 | 5 | exit | Exit process |
 | 6 | ls | List directory |
 | 7 | cat | Read file |
@@ -100,7 +100,7 @@ make run-debug
 
 ---
 
-## Boot Experience
+## First Boot Experience
 
 When you run `make run`, a QEMU window opens. At the Limine menu, press **ENTER** to boot TS-OS.
 
@@ -170,9 +170,10 @@ BoggersTheOS/
 
 ---
 
-## Honest Limitations
+## Current Limitations
 
-- **Keyboard** – US QWERTY scancode set 1 only
+- **Keyboard** – US QWERTY scancode set 1 only; click the QEMU window to give it focus before typing
+- **VGA** – Framebuffer via Limine; if the window stays black, try `make run-debug` and use serial
 - **No fork/exec** – Spawn only; no ELF loader
 - **No networking** – No TCP/IP stack
 - **No fd table** – open/close/read/write via path, not fd
@@ -214,12 +215,13 @@ MIT (same as BoggersTheCIG).
 
 | Metric | Before | After |
 |--------|--------|-------|
-| VGA visibility | Black screen in QEMU | Framebuffer mapped via full phys + HHDM |
-| Output primary | Serial | VGA (serial optional via run-debug) |
-| Input primary | Keyboard or serial | PS/2 keyboard |
-| Welcome | In host terminal | On VGA inside VM |
-| Status bar | None | Bottom row: nodes, act, tension |
-| make run | Serial stdio | VGA window, no serial |
+| Boot stability | Reboot loop (timer fault) | Stable boot with IST for timer |
+| Timer interrupt | Masked (0xFF), no scheduler | Unmasked (0xFE), IST stack, scheduler runs |
+| Framebuffer | Leftover Limine text visible | Full-screen clear on init |
+| Shell | Never started | Starts after boot messages |
+| VGA visibility | Black or garbled | Clean screen, framebuffer via Limine |
+
+**Boot behavior:** Kernel boots with Limine, clears the framebuffer, prints "TS-OS Strongest Node online", process graph info, "Heap OK", then the shell prompt appears. Timer uses a dedicated IST stack to avoid faults.
 
 **Exact test commands:**
 ```bash
