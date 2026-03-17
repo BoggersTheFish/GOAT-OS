@@ -2,7 +2,7 @@
 //!
 //! Kernel = core_engine (structural search, pattern discovery, constraint resolution)
 //! Scheduler = pure Strongest Node weighted spreading activation
-//! Real context switch: save/restore RSP, yield_to_kernel from node entries
+//! PIT timer interrupt + preemptive scheduler (replaces busy-wait)
 
 #![no_std]
 #![no_main]
@@ -11,6 +11,9 @@ use core::arch::asm;
 
 use limine::request::{RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
+use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
+use x86_64::structures::idt::InterruptDescriptorTable;
+use x86_64::VirtAddr;
 
 #[used]
 #[unsafe(link_section = ".requests")]
@@ -29,16 +32,26 @@ const DLL: u16 = COM1 + 0;
 const DLM: u16 = COM1 + 1;
 const FCR: u16 = COM1 + 2;
 
+const PIT_CH0: u16 = 0x40;
+const PIT_CMD: u16 = 0x43;
+const PIC1_CMD: u16 = 0x20;
+const PIC1_DATA: u16 = 0x21;
+const PIC2_CMD: u16 = 0xA0;
+const PIC2_DATA: u16 = 0xA1;
+
 const MAX_NODES: usize = 8;
 const MAX_NEIGHBORS: usize = 4;
 const NEIGHBOR_NONE: u8 = 0xFF;
 const STACK_SIZE: usize = 4096;
-
-/// ~100ms busy loop (QEMU: ~50–100ms depending on host)
-const TICK_LOOPS: u64 = 80_000_000;
+const IRQ_TIMER: u8 = 32;
 
 static mut KERNEL_RSP: u64 = 0;
-static mut CURRENT_NODE_IDX: usize = 0;
+static mut CURRENT_NODE_IDX: usize = 0xFF;
+static mut TICK_COUNT: u32 = 0;
+
+extern "C" {
+    fn timer_stub();
+}
 
 #[inline(always)]
 unsafe fn outb(port: u16, byte: u8) {
@@ -87,7 +100,6 @@ enum NodeState {
     Running = 1,
 }
 
-/// Process graph node: id, activation, tension, state, neighbors, stack, saved context
 struct ProcessNode {
     id: u32,
     activation: u32,
@@ -118,7 +130,6 @@ impl ProcessNode {
     }
 }
 
-/// In-RAM process graph (static array, no heap)
 struct ProcessGraph {
     nodes: [ProcessNode; MAX_NODES],
     count: usize,
@@ -200,50 +211,38 @@ impl ProcessGraph {
 
 static mut GRAPH: ProcessGraph = ProcessGraph::new();
 
-fn busy_wait(loops: u64) {
-    let mut i = 0u64;
-    while i < loops {
-        core::hint::spin_loop();
-        i += 1;
-    }
-}
-
 fn small_delay() {
     for _ in 0..1000 {
         core::hint::spin_loop();
     }
 }
 
-/// Switch to node: save kernel RSP, set RSP to node stack, jump to entry. Resumes if saved_rsp != 0.
-#[inline(never)]
-unsafe fn switch_to_node(idx: usize) {
-    asm!("mov {}, rsp", out(reg) KERNEL_RSP, options(nostack, preserves_flags));
-    CURRENT_NODE_IDX = idx;
-    let node = &mut GRAPH.nodes[idx];
-    if node.saved_rsp != 0 {
-        asm!(
-            "mov rsp, {}",
-            "jmp {}",
-            in(reg) node.saved_rsp,
-            in(reg) node.saved_rip,
-            options(nostack, preserves_flags)
-        );
-    } else {
-        let rsp_val = node.stack.as_ptr().add(STACK_SIZE - 8) as u64;
-        asm!(
-            "mov rsp, {}",
-            "ret",
-            in(reg) rsp_val,
-            options(nostack, preserves_flags)
-        );
-    }
+unsafe fn pic_remap() {
+    outb(PIC1_CMD, 0x11);
+    outb(PIC2_CMD, 0x11);
+    outb(PIC1_DATA, IRQ_TIMER);
+    outb(PIC2_DATA, IRQ_TIMER + 8);
+    outb(PIC1_DATA, 0x04);
+    outb(PIC2_DATA, 0x02);
+    outb(PIC1_DATA, 0x01);
+    outb(PIC2_DATA, 0x01);
+    outb(PIC1_DATA, 0xFE);
+    outb(PIC2_DATA, 0xFF);
 }
 
-/// Yield: save node context, restore kernel RSP, return to scheduler
-#[inline(never)]
+unsafe fn pit_init() {
+    let divisor = 11932u16;
+    outb(PIT_CMD, 0x34);
+    outb(PIT_CH0, (divisor & 0xFF) as u8);
+    outb(PIT_CH0, (divisor >> 8) as u8);
+}
+
 #[no_mangle]
 unsafe extern "C" fn yield_to_kernel() {
     let idx = CURRENT_NODE_IDX;
+    if idx == 0xFF {
+        return;
+    }
     let node = &mut GRAPH.nodes[idx];
     let rsp: u64;
     let rip: u64;
@@ -254,11 +253,53 @@ unsafe extern "C" fn yield_to_kernel() {
     asm!("mov rsp, {}", in(reg) KERNEL_RSP, options(nostack, preserves_flags));
 }
 
-/// Node entry: infinite loop, do work, yield. Dispatches by CURRENT_NODE_IDX.
+#[no_mangle]
+pub unsafe extern "C" fn timer_handler(frame_ptr: *mut u8) -> u64 {
+    outb(PIC1_CMD, 0x20);
+
+    TICK_COUNT += 1;
+
+    let cur = if CURRENT_NODE_IDX != 0xFF {
+        Some(CURRENT_NODE_IDX)
+    } else {
+        None
+    };
+
+    if let Some(idx) = cur {
+        GRAPH.nodes[idx].saved_rsp = frame_ptr as u64;
+    } else {
+        KERNEL_RSP = frame_ptr as u64 + 120;
+    }
+
+    let current = GRAPH.select_strongest();
+    if let Some(c) = current {
+        GRAPH.decay_all(c);
+        GRAPH.spread_from(c);
+    }
+
+    let new_strongest = GRAPH.select_strongest();
+    if let Some(ns) = new_strongest {
+        GRAPH.nodes[ns].state = NodeState::Running;
+        let do_switch = cur != Some(ns) || cur.is_none();
+        if do_switch {
+            CURRENT_NODE_IDX = ns;
+            if GRAPH.nodes[ns].saved_rsp != 0 {
+                return GRAPH.nodes[ns].saved_rsp;
+            }
+            return GRAPH.nodes[ns].stack.as_ptr().add(STACK_SIZE - 160) as u64;
+        }
+    }
+
+    0
+}
+
 #[inline(never)]
 unsafe extern "C" fn node_entry() {
     loop {
         let idx = CURRENT_NODE_IDX;
+        if idx == 0xFF {
+            break;
+        }
         let node_id = GRAPH.nodes[idx].id;
         let act = GRAPH.nodes[idx].activation;
         match node_id {
@@ -280,12 +321,22 @@ unsafe extern "C" fn node_entry() {
     }
 }
 
-/// Initialize node stack: write entry point at top so `ret` jumps to node_entry
 fn init_node_stacks(g: &mut ProcessGraph) {
-    let entry_addr = node_entry as *const () as u64;
+    let entry = node_entry as *const () as u64;
+    let code_sel = 0x08u64;
+    let data_sel = 0x10u64;
+    let rflags = 0x202u64;
     for i in 0..g.count {
-        let slot = g.nodes[i].stack.as_mut_ptr().add(STACK_SIZE - 8) as *mut u64;
-        unsafe { slot.write(entry_addr) };
+        let base = g.nodes[i].stack.as_mut_ptr().add(STACK_SIZE - 160) as *mut u64;
+        let base_addr = base as u64;
+        for j in 0..15 {
+            base.add(j).write(0);
+        }
+        base.add(15).write(entry);
+        base.add(16).write(code_sel);
+        base.add(17).write(rflags);
+        base.add(18).write(base_addr);
+        base.add(19).write(data_sel);
     }
 }
 
@@ -299,6 +350,20 @@ unsafe extern "C" fn kmain() -> ! {
     serial_init();
     serial_write("TS-OS Strongest Node online\r\n");
 
+    let mut gdt = GlobalDescriptorTable::new();
+    gdt.append(Descriptor::kernel_code_segment());
+    gdt.append(Descriptor::kernel_data_segment());
+    gdt.load();
+
+    let mut idt = InterruptDescriptorTable::new();
+    unsafe {
+        idt[IRQ_TIMER as usize].set_handler_addr(VirtAddr::from_ptr(timer_stub));
+    }
+    idt.load();
+
+    pic_remap();
+    pit_init();
+
     let g = &mut GRAPH;
     g.add_node(0, 100, 0, &[1, 3]);
     g.add_node(1, 80, 10, &[0, 2]);
@@ -307,37 +372,12 @@ unsafe extern "C" fn kmain() -> ! {
     g.add_node(4, 80, 0, &[0]);
 
     init_node_stacks(g);
-    serial_write("Process graph: 5 nodes, real context switch, yield_to_kernel\r\n");
+    serial_write("Process graph: 5 nodes, PIT preemption, yield_to_kernel\r\n");
 
-    let mut prev_strongest: Option<usize> = None;
+    asm!("sti");
 
-    for tick_num in 0..8u32 {
-        busy_wait(TICK_LOOPS);
-
-        let current = g.select_strongest();
-        if let Some(cur) = current {
-            g.decay_all(cur);
-            g.spread_from(cur);
-            let new_strongest = g.select_strongest().unwrap();
-            let id = g.nodes[new_strongest].id;
-            let act = g.nodes[new_strongest].activation;
-            g.nodes[new_strongest].state = NodeState::Running;
-
-            let do_switch = prev_strongest != Some(new_strongest);
-            prev_strongest = Some(new_strongest);
-
-            if do_switch {
-                serial_write("tick ");
-                serial_write_u32(tick_num);
-                serial_write(": switch to node ");
-                serial_write_u32(id);
-                serial_write(" (act=");
-                serial_write_u32(act);
-                serial_write(")\r\n");
-
-                switch_to_node(new_strongest);
-            }
-        }
+    while TICK_COUNT < 20 {
+        asm!("hlt");
     }
 
     serial_write("TS-OS tick loop complete. HCF.\r\n");

@@ -10,7 +10,7 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 
 | Component | Status |
 |-----------|--------|
-| **Strongest Node** | Final release + documentation (activation 100, tension 0) |
+| **Strongest Node** | PIT timer + preemptive scheduler (activation 100, tension 0) |
 | **Secondary nodes** | 5 process nodes in static graph |
 
 ### Node Table
@@ -23,17 +23,21 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 | 3 | 3 | 40 | 20 | 2, 0 |
 | 4 | 4 | 80 | 0 | 0 |
 
-**Tensions:** None  
-**Coherence delta:** Stable (release iteration)
+**Tensions resolved:** No timer interrupt / real preemption  
+**Tensions remaining:** No user mode, no dynamic process creation, no heap, no filesystem, serial-only, no shell  
+**Coherence delta:** +1 (PIT replaces busy-wait)
 
 ---
 
 ## Implemented Features
 
 - **Boot with Limine** – x86_64 bare-metal boot via Limine bootloader (BIOS + UEFI)
+- **PIT timer interrupt** – Real ~10ms tick (11932 divisor), PIC remapped, IRQ0 → vector 32
+- **Preemptive scheduler** – Timer fires, saves full context, runs decay/spread/select, switches via iretq
+- **GDT + IDT** – x86_64 crate for GDT (code/data segments), IDT with assembly stub for timer
 - **Static ProcessGraph** – In-RAM process graph with `[ProcessNode; 8]`, no heap
 - **Per-node 4 KiB stacks** – Each node has `stack: [u8; 4096]`, `saved_rip`, `saved_rsp`
-- **Real context switch** – `switch_to_node()` saves kernel RSP, switches to node stack, jumps to entry or resumes from saved RIP/RSP
+- **Real context switch** – Assembly stub saves GPRs, timer_handler returns new frame ptr, iretq restores
 - **`yield_to_kernel()`** – Node entries call this to save context and return to scheduler
 - **Spreading activation scheduler** – Select strongest node by `activation - tension`; running node spreads +10 to neighbors
 - **Decay** – Inactive nodes lose 2 activation per tick
@@ -99,13 +103,14 @@ BoggersTheOS/
 ├── README.md
 ├── build.ps1             # Windows kernel-only build helper
 └── kernel/
-    ├── Cargo.toml        # ts-os-kernel, limine 0.5
+    ├── Cargo.toml        # ts-os-kernel, limine 0.5, x86_64 0.14
     ├── build.rs
     ├── GNUmakefile
     ├── linker-x86_64.ld
     ├── rust-toolchain.toml  # nightly, x86_64-unknown-none
     └── src/
-        └── main.rs       # ~360 LOC
+        ├── main.rs       # ~400 LOC
+        └── idt.S         # Timer interrupt stub (minimal asm)
 ```
 
 ---
@@ -138,8 +143,8 @@ BoggersTheOS/
 
 After push, the next Strongest Node candidates:
 
-1. **Timer interrupt** – Replace busy-loop tick with PIT/APIC for real ~100ms scheduling
-2. **User-mode ring** – Ring 3 execution for node entries (requires GDT, TSS, ring transition)
+1. **User-mode ring** – Ring 3 execution for node entries (requires TSS, ring transition)
+2. **Heap allocator** – Simple bump or buddy for dynamic memory
 3. **In-RAM file system** – Hierarchical node graph as files (no disk, pure RAM)
 4. **Process emergence from workload** – Triple extraction: spawn nodes from detected patterns
 
