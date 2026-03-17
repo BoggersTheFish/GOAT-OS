@@ -1,5 +1,49 @@
 # Changelog
 
+## 2025-03-17 – Phase 1: Stability Foundation (Partial)
+
+### Summary
+Phase 1 of the TS-OS Full Development Roadmap. Fixed boot crash (allocator), added Limine framebuffer VGA driver, removed debug instrumentation. Boot is stable; VGA output does not yet appear in QEMU window (serial-only).
+
+---
+
+### Allocator
+- **Heap increased** – 64 KiB → 256 KiB (bump allocator)
+- **Boot crash fixed** – ALLOC ERROR no longer occurs during boot
+
+### VGA
+- **Limine framebuffer** – Added `FramebufferRequest` and `HhdmRequest` to limine requests
+- **vga.rs** – New framebuffer text driver: 8×8 font (font8x8_basic), 80×25 text grid, scroll, clear
+- **Address handling** – HHDM applied only when framebuffer address < 4 GB (physical); addresses ≥ 4 GB used as-is
+- **Status** – Framebuffer received (e.g. 1280×800); display does not appear in QEMU window; serial output works
+
+### Debug
+- **Removed** – `dbg: before GRAPH`, `dbg: before add_node 0`, `dbg: before init_node_stacks`, `dbg: before Vec Heap OK`
+- **Simplified** – `alloc_error` now prints only `ALLOC ERR` (no layout details)
+- **Removed** – `serial_write_u32` (was dead code after alloc_error change)
+- **Added** – Serial debug for framebuffer: `FB: 0x... -> 0x... WxH` on boot
+
+### README
+- Updated status: 256 KiB heap, VGA framebuffer implementation, serial-only output
+- Remaining work: VGA display in QEMU, Phase 2+ items
+
+---
+
+### Current capabilities
+- Boots with Limine (BIOS + UEFI)
+- Serial output (primary), PS/2 keyboard
+- Strongest Node scheduler with dynamic emergence (up to 32 nodes)
+- User-mode shell (help, ps, echo, spawn, ls, cat, touch, mkdir, shutdown)
+- In-RAM filesystem with checkpoint/restore
+
+### Known limitations
+- VGA framebuffer does not display in QEMU window (serial-only)
+- No paging / no process isolation
+- Bump allocator (no free)
+- Persistence in-RAM only (lost on power cycle)
+
+---
+
 ## 2025-03-17 – Post-cleanup build fix
 
 ### Summary

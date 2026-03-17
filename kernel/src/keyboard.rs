@@ -109,3 +109,16 @@ pub fn read_byte() -> Option<u8> {
 pub fn buffer_available() -> usize {
     BUF_SIZE - RING_COUNT.load(Ordering::SeqCst)
 }
+
+/// Returns true if at least one key is available in the buffer (non-blocking).
+pub fn has_key() -> bool {
+    if RING_COUNT.load(Ordering::SeqCst) > 0 {
+        return true;
+    }
+    if let Some(c) = poll() {
+        push_byte(c);
+        true
+    } else {
+        false
+    }
+}

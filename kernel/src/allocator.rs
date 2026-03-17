@@ -3,7 +3,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const HEAP_SIZE: usize = 65536;
+const HEAP_SIZE: usize = 262144;
 
 #[repr(align(4096))]
 struct HeapBacking([u8; HEAP_SIZE]);

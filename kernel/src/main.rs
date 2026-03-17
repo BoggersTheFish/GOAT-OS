@@ -23,7 +23,7 @@ use core::alloc::Layout;
 use core::arch::asm;
 use core::mem::MaybeUninit;
 
-use limine::request::{RequestsEndMarker, RequestsStartMarker};
+use limine::request::{FramebufferRequest, HhdmRequest, RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::idt::InterruptDescriptorTable;
@@ -38,6 +38,13 @@ static BASE_REVISION: BaseRevision = BaseRevision::new();
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
 static _START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
+#[used]
+#[unsafe(link_section = ".requests")]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+#[used]
+#[unsafe(link_section = ".requests")]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
 #[used]
 #[unsafe(link_section = ".requests_end_marker")]
 static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
@@ -168,7 +175,7 @@ static HEAP: allocator::BumpAllocator = allocator::BumpAllocator;
 
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
-    console_write("ALLOC ERROR\r\n");
+    serial_write("ALLOC ERR\r\n");
     hcf();
 }
 
@@ -214,6 +221,22 @@ fn serial_write_u32(n: u32) {
     while i > 0 {
         i -= 1;
         unsafe { outb(COM1, buf[i]) };
+    }
+}
+
+fn serial_write_hex(n: u64) {
+    const HEX: [u8; 16] = *b"0123456789ABCDEF";
+    serial_write("0x");
+    let mut first = true;
+    for shift in (0..64).rev().step_by(4) {
+        let nibble = ((n >> shift) & 0xF) as usize;
+        if nibble != 0 || !first || shift == 0 {
+            unsafe { outb(COM1, HEX[nibble]) };
+            first = false;
+        }
+    }
+    if first {
+        unsafe { outb(COM1, b'0') };
     }
 }
 
@@ -469,6 +492,8 @@ const SYS_TOUCH: u64 = 9;
 const SYS_MKDIR: u64 = 10;
 const SYS_WRITE_F: u64 = 11;
 const SYS_SHUTDOWN: u64 = 12;
+const SYS_CLEAR: u64 = 13;
+const SYS_POLL_KEY: u64 = 14;
 
 fn do_checkpoint() {
     let mut graph_buf = [0u8; 64];
@@ -700,6 +725,13 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
                 asm!("hlt");
             }
         }
+        SYS_CLEAR => {
+            vga::clear();
+            0
+        }
+        SYS_POLL_KEY => {
+            if keyboard::has_key() { 1 } else { 0 }
+        }
         _ => !0u64,
     }
 }
@@ -821,6 +853,33 @@ unsafe extern "C" fn kmain() -> ! {
     allocator::init();
     serial_init();
     vga::init();
+    if let Some(fb_resp) = FRAMEBUFFER_REQUEST.get_response() {
+        if let Some(fb) = fb_resp.framebuffers().next() {
+            let raw = fb.addr() as u64;
+            let addr = if raw < 0x1_0000_0000 {
+                HHDM_REQUEST
+                    .get_response()
+                    .map(|h| raw + h.offset())
+                    .unwrap_or(raw)
+            } else {
+                raw
+            };
+            serial_write("FB: ");
+            serial_write_hex(raw);
+            serial_write(" -> ");
+            serial_write_hex(addr);
+            serial_write(" ");
+            serial_write_u32(fb.width() as u32);
+            serial_write("x");
+            serial_write_u32(fb.height() as u32);
+            serial_write("\r\n");
+            vga::init_framebuffer(addr as *mut u8, fb.width(), fb.height(), fb.pitch(), fb.bpp());
+        } else {
+            serial_write("FB: no framebuffers\r\n");
+        }
+    } else {
+        serial_write("FB: no response\r\n");
+    }
     fs::init();
     let mut restored = false;
     if persist::try_restore() {

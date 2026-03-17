@@ -14,6 +14,8 @@ const SYS_TOUCH: u64 = 9;
 const SYS_MKDIR: u64 = 10;
 const SYS_WRITE_F: u64 = 11;
 const SYS_SHUTDOWN: u64 = 12;
+const SYS_CLEAR: u64 = 13;
+const SYS_POLL_KEY: u64 = 14;
 
 fn syscall0(n: u64) -> u64 {
     let ret: u64;
@@ -66,6 +68,14 @@ fn do_read(buf: &mut [u8]) -> usize {
 
 fn do_yield() {
     syscall0(SYS_YIELD);
+}
+
+fn do_clear_screen() {
+    syscall0(SYS_CLEAR);
+}
+
+fn do_poll_key() -> bool {
+    syscall0(SYS_POLL_KEY) != 0
 }
 
 fn do_spawn() -> u64 {
@@ -150,11 +160,88 @@ enum EchoResult<'a> {
     ToFile { content: &'a str, path: &'a str },
 }
 
+fn show_welcome_screen() {
+    do_clear_screen();
+    do_write("\r\n");
+    do_write("  ==========================================\r\n");
+    do_write("            T S - O S\r\n");
+    do_write("  ==========================================\r\n");
+    do_write("\r\n");
+    do_write("  This is a living operating system powered by the\r\n");
+    do_write("  Strongest Node Framework from BoggersTheCIG.\r\n");
+    do_write("\r\n");
+    do_write("  Basic commands:\r\n");
+    do_write("    help   - show full command list\r\n");
+    do_write("    ps     - list processes (nodes)\r\n");
+    do_write("    spawn  - spawn new process\r\n");
+    do_write("    echo   - echo text (or echo \"x\" > file)\r\n");
+    do_write("    ls     - list directory\r\n");
+    do_write("    cat    - read file\r\n");
+    do_write("    touch  - create file\r\n");
+    do_write("    mkdir  - create directory\r\n");
+    do_write("    shutdown - checkpoint and halt\r\n");
+    do_write("\r\n");
+    do_write("  Type 'help' for full command list.\r\n");
+    do_write("  Nodes emerge automatically based on system tension.\r\n");
+    do_write("\r\n");
+    do_write("  Press any key to continue, or wait 4 seconds...\r\n");
+    do_write("\r\n");
+
+    const WAIT_TICKS: u32 = 400;
+    for _ in 0..WAIT_TICKS {
+        if do_poll_key() {
+            let mut discard = [0u8; 1];
+            do_read(&mut discard);
+            break;
+        }
+        do_yield();
+    }
+
+    do_clear_screen();
+}
+
+fn show_help() {
+    do_write("\r\n  TS-OS Commands\r\n");
+    do_write("  --------------\r\n");
+    do_write("  help       Show this command list\r\n");
+    do_write("  about      Strongest Node philosophy and status\r\n");
+    do_write("  ps         List all processes (nodes) with activation/tension\r\n");
+    do_write("  spawn      Spawn a new process (node emerges)\r\n");
+    do_write("  echo TEXT  Print TEXT to screen\r\n");
+    do_write("  echo \"TEXT\" > PATH  Write TEXT to file\r\n");
+    do_write("  ls [PATH]  List directory (default: /)\r\n");
+    do_write("  cat PATH   Read and display file contents\r\n");
+    do_write("  touch PATH   Create empty file\r\n");
+    do_write("  mkdir PATH   Create directory\r\n");
+    do_write("  exit       Exit current process\r\n");
+    do_write("  shutdown   Checkpoint filesystem and halt\r\n");
+    do_write("\r\n");
+}
+
+fn show_about() {
+    do_write("\r\n  TS-OS - Strongest Node Operating System\r\n");
+    do_write("  ----------------------------------------\r\n");
+    do_write("  The kernel is the Strongest Node. All other components\r\n");
+    do_write("  exist as secondary nodes that dynamically emerge,\r\n");
+    do_write("  strengthen, spread activation, detect tension, decay,\r\n");
+    do_write("  merge, or get pruned.\r\n");
+    do_write("\r\n");
+    do_write("  Philosophy (from BoggersTheCIG):\r\n");
+    do_write("  - Strongest Node drives everything\r\n");
+    do_write("  - Secondary nodes = processes\r\n");
+    do_write("  - Emergence: nodes spawn when tension is high\r\n");
+    do_write("  - Tension resolution: bugs and inefficiency are tensions\r\n");
+    do_write("\r\n");
+    do_write("  Current status: VGA + keyboard, Strongest Node scheduler,\r\n");
+    do_write("  dynamic process spawning, in-RAM filesystem.\r\n");
+    do_write("\r\n");
+}
+
 pub fn shell_main() {
     let mut line_buf = [0u8; 128];
     let mut out_buf = [0u8; 256];
 
-    do_write("TS-OS shell. Type 'help' for commands.\r\n");
+    show_welcome_screen();
 
     loop {
         do_write("> ");
@@ -172,15 +259,8 @@ pub fn shell_main() {
         }
 
         match args[0] {
-            "help" => {
-                do_write("help     - show this\r\n");
-                do_write("ps       - list processes\r\n");
-                do_write("echo     - echo text\r\n");
-                do_write("spawn    - spawn new process\r\n");
-                do_write("ls       - list directory\r\n");
-                do_write("cat      - read file\r\n");
-                do_write("shutdown - checkpoint and halt\r\n");
-            }
+            "help" => show_help(),
+            "about" | "welcome" => show_about(),
             "ps" => {
                 let n = do_ps(&mut out_buf);
                 out_buf[n.min(out_buf.len() - 1)] = 0;
