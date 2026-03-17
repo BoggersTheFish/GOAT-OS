@@ -12,12 +12,14 @@ extern crate alloc;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use limine::request::{RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::idt::InterruptDescriptorTable;
+use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
 
 #[used]
@@ -50,6 +52,8 @@ const NEIGHBOR_NONE: u8 = 0xFF;
 const STACK_SIZE: usize = 4096;
 const IRQ_TIMER: u8 = 32;
 const HEAP_SIZE: usize = 65536;
+const SYSCALL_VECTOR: u8 = 0x80;
+const KERNEL_STACK_SIZE: usize = 4096;
 
 static mut KERNEL_RSP: u64 = 0;
 static mut CURRENT_NODE_IDX: usize = 0xFF;
@@ -57,7 +61,13 @@ static mut TICK_COUNT: u32 = 0;
 
 extern "C" {
     fn timer_stub();
+    fn syscall_stub();
 }
+
+#[repr(align(16))]
+struct KernelStack([u8; KERNEL_STACK_SIZE]);
+static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_SIZE]);
+static mut TSS: MaybeUninit<TaskStateSegment> = MaybeUninit::uninit();
 
 #[repr(align(4096))]
 struct HeapBacking([u8; HEAP_SIZE]);
@@ -263,6 +273,25 @@ fn small_delay() {
     }
 }
 
+fn do_sys_write(buf: &[u8]) {
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_WRITE,
+            in("rdi") 1u64,
+            in("rsi") buf.as_ptr(),
+            in("rdx") buf.len(),
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+fn do_sys_yield() {
+    unsafe {
+        asm!("int 0x80", in("rax") SYS_YIELD, options(nostack, preserves_flags));
+    }
+}
+
 unsafe fn pic_remap() {
     outb(PIC1_CMD, 0x11);
     outb(PIC2_CMD, 0x11);
@@ -297,6 +326,57 @@ unsafe extern "C" fn yield_to_kernel() {
     node.saved_rsp = rsp;
     node.saved_rip = rip;
     asm!("mov rsp, {}", in(reg) KERNEL_RSP, options(nostack, preserves_flags));
+}
+
+const SYS_WRITE: u64 = 1;
+const SYS_YIELD: u64 = 2;
+const SYS_SPAWN: u64 = 3;
+
+#[no_mangle]
+pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
+    let frame = frame_ptr as *const u64;
+    let syscall = *frame.add(0);
+    match syscall {
+        SYS_WRITE => {
+            let _fd = *frame.add(5);
+            let buf = *frame.add(4) as *const u8;
+            let len = *frame.add(3) as usize;
+            for i in 0..len {
+                outb(COM1, *buf.add(i));
+            }
+            0
+        }
+        SYS_YIELD => {
+            if CURRENT_NODE_IDX != 0xFF {
+                GRAPH.nodes[CURRENT_NODE_IDX].saved_rsp = frame_ptr as u64;
+            }
+            let cur = if CURRENT_NODE_IDX != 0xFF {
+                Some(CURRENT_NODE_IDX)
+            } else {
+                None
+            };
+            let current = GRAPH.select_strongest();
+            if let Some(c) = current {
+                GRAPH.decay_all(c);
+                GRAPH.spread_from(c);
+            }
+            let new_strongest = GRAPH.select_strongest();
+            if let Some(ns) = new_strongest {
+                GRAPH.nodes[ns].state = NodeState::Running;
+                let do_switch = cur != Some(ns) || cur.is_none();
+                if do_switch {
+                    CURRENT_NODE_IDX = ns;
+                    if GRAPH.nodes[ns].saved_rsp != 0 {
+                        return GRAPH.nodes[ns].saved_rsp;
+                    }
+                    return GRAPH.nodes[ns].stack.as_ptr().add(STACK_SIZE - 160) as u64;
+                }
+            }
+            0
+        }
+        SYS_SPAWN => !0u64 as u64,
+        _ => !0u64 as u64,
+    }
 }
 
 #[no_mangle]
@@ -350,20 +430,20 @@ unsafe extern "C" fn node_entry() {
         let act = GRAPH.nodes[idx].activation;
         match node_id {
             0 => {
-                serial_write("Node 0 stats: act=");
-                serial_write_u32(act);
-                serial_write("\r\n");
+                do_sys_write(b"Node 0 stats: act=");
+                let s = alloc::format!("{}\r\n", act);
+                do_sys_write(s.as_bytes());
             }
-            1 => serial_write("Node 1 alive\r\n"),
-            4 => serial_write("Node 4 working\r\n"),
+            1 => do_sys_write(b"Node 1 alive\r\n"),
+            4 => do_sys_write(b"Node 4 working\r\n"),
             _ => {
-                serial_write("Node ");
-                serial_write_u32(node_id);
-                serial_write(" tick\r\n");
+                do_sys_write(b"Node ");
+                let s = alloc::format!("{} tick\r\n", node_id);
+                do_sys_write(s.as_bytes());
             }
         }
         small_delay();
-        yield_to_kernel();
+        do_sys_yield();
     }
 }
 
@@ -399,11 +479,24 @@ unsafe extern "C" fn kmain() -> ! {
     let mut gdt = GlobalDescriptorTable::new();
     gdt.append(Descriptor::kernel_code_segment());
     gdt.append(Descriptor::kernel_data_segment());
+    gdt.append(Descriptor::user_code_segment());
+    gdt.append(Descriptor::user_data_segment());
+    let tss = TSS.write(TaskStateSegment {
+        privilege_stack_table: [VirtAddr::zero(); 3],
+        interrupt_stack_table: [VirtAddr::zero(); 7],
+        iomap_base: 0,
+    });
+    tss.privilege_stack_table[0] = VirtAddr::from_ptr(
+        KERNEL_STACK.0.as_ptr().add(KERNEL_STACK_SIZE) as *const u8,
+    );
+    let tss_sel = gdt.append(Descriptor::tss_segment(unsafe { TSS.assume_init_ref() }));
     gdt.load();
+    unsafe { x86_64::instructions::tables::load_tss(tss_sel) };
 
     let mut idt = InterruptDescriptorTable::new();
     unsafe {
         idt[IRQ_TIMER as usize].set_handler_addr(VirtAddr::from_ptr(timer_stub));
+        idt[SYSCALL_VECTOR as usize].set_handler_addr(VirtAddr::from_ptr(syscall_stub));
     }
     idt.load();
 

@@ -10,7 +10,7 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 
 | Component | Status |
 |-----------|--------|
-| **Strongest Node** | Bump heap allocator (activation 100, tension 0) |
+| **Strongest Node** | User-mode foundation + syscall interface (activation 100, tension 0) |
 | **Secondary nodes** | 5 process nodes in static graph |
 
 ### Node Table
@@ -23,9 +23,9 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 | 3 | 3 | 40 | 20 | 2, 0 |
 | 4 | 4 | 80 | 0 | 0 |
 
-**Tensions resolved:** No heap allocator  
-**Tensions remaining:** No user mode, no dynamic process creation, no filesystem, serial-only, no shell  
-**Coherence delta:** +1 (64 KiB bump heap, enables future dynamic allocation)
+**Tensions resolved:** No syscall interface  
+**Tensions remaining:** No actual ring 3 (nodes still ring 0), no dynamic process creation, no filesystem, serial-only, no shell  
+**Coherence delta:** +1 (GDT user segments, TSS, INT 0x80 syscalls)
 
 ---
 
@@ -33,18 +33,20 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 
 - **Boot with Limine** – x86_64 bare-metal boot via Limine bootloader (BIOS + UEFI)
 - **Bump heap allocator** – 64 KiB static backing, GlobalAlloc, atomic bump pointer, no free
+- **GDT user segments + TSS** – User code/data segments (ring 3), TSS with kernel stack for interrupts
+- **Syscall interface (INT 0x80)** – sys_write (1), sys_yield (2), sys_spawn (3, stub)
+- **Node entries use syscalls** – do_sys_write, do_sys_yield via int 0x80
 - **PIT timer interrupt** – Real ~10ms tick (11932 divisor), PIC remapped, IRQ0 → vector 32
 - **Preemptive scheduler** – Timer fires, saves full context, runs decay/spread/select, switches via iretq
-- **GDT + IDT** – x86_64 crate for GDT (code/data segments), IDT with assembly stub for timer
+- **GDT + IDT** – x86_64 crate for GDT (kernel + user segments, TSS), IDT with timer + syscall stubs
 - **Static ProcessGraph** – In-RAM process graph with `[ProcessNode; 8]`
 - **Per-node 4 KiB stacks** – Each node has `stack: [u8; 4096]`, `saved_rip`, `saved_rsp`
-- **Real context switch** – Assembly stub saves GPRs, timer_handler returns new frame ptr, iretq restores
-- **`yield_to_kernel()`** – Node entries call this to save context and return to scheduler
+- **Real context switch** – Assembly stub saves GPRs, timer_handler/syscall_handler returns new frame ptr, iretq restores
 - **Spreading activation scheduler** – Select strongest node by `activation - tension`; running node spreads +10 to neighbors
 - **Decay** – Inactive nodes lose 2 activation per tick
 - **Switch only when different** – Context switch only when the newly selected strongest node differs from the previous
 - **Serial output** – COM1 (0x3F8) for all output; QEMU `-serial stdio` shows output in terminal
-- **Node entry functions** – Node 0 prints stats, Node 1 "alive", Node 4 "working"; infinite loop with yield after each action
+- **Node entry functions** – Node 0 stats, Node 1 "alive", Node 4 "working"; use sys_write + sys_yield
 
 ---
 
@@ -144,8 +146,8 @@ BoggersTheOS/
 
 After push, the next Strongest Node candidates:
 
-1. **User-mode ring** – Ring 3 execution for node entries (requires TSS, ring transition)
-2. **Dynamic process emergence** – Spawn new nodes at runtime using heap
+1. **Actual ring 3** – iretq to user CS/SS (requires user-accessible page; paging changes)
+2. **Dynamic process emergence** – sys_spawn creates nodes at runtime using heap
 3. **In-RAM file system** – Hierarchical node graph as files (no disk, pure RAM)
 4. **Process emergence from workload** – Triple extraction: spawn nodes from detected patterns
 
@@ -153,7 +155,7 @@ After push, the next Strongest Node candidates:
 
 ## Current Limitations
 
-This is still a minimal research kernel, not a complete usable OS. No user mode, no shell, no filesystem, no keyboard/VGA. Serial-only output. Process graph is fixed at boot. The heap is bump-only (no free). Architecture emerges node-by-node per .cursorrules.
+This is still a minimal research kernel, not a complete usable OS. Nodes run in ring 0 (kernel mode); GDT/TSS and syscall interface are in place for future ring 3. No shell, no filesystem, no keyboard/VGA. Serial-only output. Process graph is fixed at boot. sys_spawn is a stub. The heap is bump-only (no free). Architecture emerges node-by-node per .cursorrules.
 
 ---
 
