@@ -14,6 +14,7 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 | **Paging** | 4-level paging, CR3 switch per process |
 | **Heap** | `linked_list_allocator::LockedHeap` (demand-mapped via #PF) |
 | **Keyboard** | Shift, caps lock, arrows, backspace, 128-byte buffer |
+| **Timer / Preemption** | PIT IRQ0 re-entrancy persists; `timer_handler` storms and kernel double-faults (DF/HCF) |
 | **Persistence** | RAM + disk checkpoint; restore from disk on boot |
 | **Process graph** | Vec-based, up to 32 nodes, parent-child, wait |
 | **Process isolation** | Per-process page tables (CR3), user VMAs + demand paging |
@@ -185,6 +186,7 @@ BoggersTheOS/
 - **VGA** – Framebuffer via Limine; if the window stays black, try `make run-debug` and use serial
 - **fork** – not implemented yet
 - **execve** – implemented, but user program bringup is still under active debug
+- **Timer / preemption** – PIT IRQ0 handling currently fails under load: serial prints repeated `timer_handler entered` and then `DF` followed by `HCF` (double-fault path). This makes scheduler preemption unstable.
 - **No networking** – No TCP/IP stack
 - **No fd table** – open/close/read/write via path, not fd
 
@@ -225,19 +227,19 @@ MIT (same as BoggersTheCIG).
 
 | Metric | Before | After |
 |--------|--------|-------|
-| Boot | Stuck at Limine menu; kernel never starts | _start → kmain → serial_init → "K1 - Kernel entry reached" |
+| Boot | Stuck at Limine menu; kernel never starts | _start → kmain → serial_init → "K1 - Kernel entry" |
 | Entry point | ENTRY(kmain) | ENTRY(_start); _start in .text._start calls kmain |
-| Kernel | Full kmain (allocator, VGA, etc.) | Minimal: serial_init + K1 message + hlt |
+| Kernel | Full kmain (allocator, VGA, etc.) | Reaches scheduler/timer hot path, but crashes on PIT timer re-entrancy |
 | limine.conf | 1-space indent | 4-space indent (proper format) |
 
-**Boot behavior:** Diagnostic iteration only. _start (assembly) → kmain → serial_init → serial_write("K1 - Kernel entry reached\r\n") → hlt. No allocator, VGA, or shell. Goal: confirm kernel entry is reached.
+**Boot behavior:** Diagnostic iteration. _start (assembly) → kmain → serial_init → serial_write("K1 - Kernel entry\r\n") → boot init → enters PIT timer ISR, repeatedly logs `timer_handler entered`, then triggers `DF`/`HCF` due to persistent timer re-entrancy.
 
 **Exact test commands (WSL/MSYS2):**
 ```bash
 cd BoggersTheOS
 make clean && make all && make run-debug
 # 1. At Limine: select TS-OS, press ENTER
-# 2. If kernel entry works: serial shows "K1 - Kernel entry reached"
+# 2. If kernel entry works: serial shows "K1 - Kernel entry"
 # 3. If still stuck at menu: report back; Limine may not be loading/jumping to kernel
 ```
 

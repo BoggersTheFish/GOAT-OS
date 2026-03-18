@@ -166,6 +166,49 @@ pub fn is_page_present(cr3: u64, hhdm: u64, virt: u64) -> bool {
     }
 }
 
+/// Set or clear the writable bit for an already-mapped 4KiB page.
+/// Returns false if the page tables are missing or the PTE isn't present.
+pub fn set_page_writable(cr3: u64, hhdm: u64, virt: u64, writable: bool) -> bool {
+    let pml4_virt = (cr3 + hhdm) as *mut Table;
+    let p4_idx = ((virt >> 39) & 0x1FF) as usize;
+    let p3_idx = ((virt >> 30) & 0x1FF) as usize;
+    let p2_idx = ((virt >> 21) & 0x1FF) as usize;
+    let p1_idx = ((virt >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        let pml4 = &mut *pml4_virt;
+        if pml4[p4_idx] & PRESENT == 0 {
+            return false;
+        }
+        let p3 = &mut *(((pml4[p4_idx] & !0xFFF) + hhdm) as *mut Table);
+        if p3[p3_idx] & PRESENT == 0 {
+            return false;
+        }
+        let p2 = &mut *(((p3[p3_idx] & !0xFFF) + hhdm) as *mut Table);
+        if p2[p2_idx] & PRESENT == 0 {
+            return false;
+        }
+        if p2[p2_idx] & HUGE != 0 {
+            // Not supported yet (should be 4KiB pages for our kernel heap mapping).
+            return false;
+        }
+        let p1 = &mut *(((p2[p2_idx] & !0xFFF) + hhdm) as *mut Table);
+        if p1[p1_idx] & PRESENT == 0 {
+            return false;
+        }
+
+        let mut entry = p1[p1_idx];
+        if writable {
+            entry |= WRITABLE;
+        } else {
+            entry &= !WRITABLE;
+        }
+        p1[p1_idx] = entry;
+    }
+
+    true
+}
+
 /// Allocate a page-aligned frame from heap. Returns (physical_addr, virtual_ptr).
 fn alloc_frame(hhdm_offset: u64) -> Option<(u64, *mut Table)> {
     let frame = alloc_phys_frame()?;

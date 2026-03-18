@@ -173,6 +173,13 @@ core::arch::global_asm!(
     .section .text._start
     .global _start
 _start:
+    mov dx, 0x3F8
+    mov al, 'A'
+    out dx, al
+    mov al, '\r'
+    out dx, al
+    mov al, '\n'
+    out dx, al
     call kmain
     hlt
     jmp _start
@@ -229,6 +236,9 @@ syscall_stub:
     iretq
 
 timer_stub:
+    cli
+    mov al, 0x20
+    out 0x20, al
     push rax
     push rbx
     push rcx
@@ -246,10 +256,6 @@ timer_stub:
     push r15
     mov rdi, rsp
     call timer_handler
-    cmp rax, 0
-    jz .no_switch_timer
-    mov rsp, rax
-.no_switch_timer:
     pop r15
     pop r14
     pop r13
@@ -265,6 +271,7 @@ timer_stub:
     pop rcx
     pop rbx
     pop rax
+    sti
     iretq
 
 bootstrap_switch:
@@ -297,111 +304,113 @@ extern "C" {
 
 #[no_mangle]
 pub unsafe extern "C" fn timer_handler(tf: &mut TrapFrame) -> u64 {
-    // Ack PIC + update tick quickly.
-    outb(PIC1_CMD, 0x20);
-    TICK_COUNT = TICK_COUNT.wrapping_add(1);
+    interrupts::without_interrupts(|| {
+        log!("timer_handler entered\r\n");
+        TICK_COUNT = TICK_COUNT.wrapping_add(1);
 
-    let cur = scheduler::current_idx();
-    if NEEDS_RESCHEDULE.swap(false, Ordering::AcqRel) {
-        scheduler::set_current_idx(None);
-    }
+        let cur = scheduler::current_idx();
+        if NEEDS_RESCHEDULE.swap(false, Ordering::AcqRel) {
+            scheduler::set_current_idx(None);
+        }
 
-    // Save current process register state (typed) with minimal work.
-    if let Some(idx) = cur {
-        let p = &mut graph().procs[idx];
-        let mut ctx = process::ProcessContext::from_trap_frame(tf);
-        // Store the current kernel trap-frame pointer in `context.rsp` so we can resume without
-        // mutating legacy `saved_rsp` in the timer hot path.
-        ctx.rsp = tf as *mut TrapFrame as u64;
-        p.context = ctx;
-        p.node.tension = p.node.tension.saturating_add(1);
-    } else {
-        // No current user process selected; keep kernel RSP so yield path remains safe.
-        KERNEL_RSP = tf as *mut TrapFrame as u64;
-    }
+        // Save current process register state (typed) with minimal work.
+        if let Some(idx) = cur {
+            let p = &mut graph().procs[idx];
+            let mut ctx = process::ProcessContext::from_trap_frame(tf);
+            // Store the current kernel trap-frame pointer in `context.rsp` so we can resume without
+            // mutating legacy `saved_rsp` in the timer hot path.
+            ctx.rsp = tf as *mut TrapFrame as u64;
+            p.context = ctx;
+            p.node.tension = p.node.tension.saturating_add(1);
+        } else {
+            // No current user process selected; keep kernel RSP so yield path remains safe.
+            KERNEL_RSP = tf as *mut TrapFrame as u64;
+        }
 
-    // Minimal Strongest Node update to decide whether to switch.
-    if let Some(c) = graph().select_strongest() {
-        graph().decay_all(c);
-        graph().spread_from(c);
-    }
-    let ns = match graph().select_strongest() {
-        Some(i) => i,
-        None => return 0,
-    };
+        // Minimal Strongest Node update to decide whether to switch.
+        if let Some(c) = graph().select_strongest() {
+            graph().decay_all(c);
+            graph().spread_from(c);
+        }
+        let ns = match graph().select_strongest() {
+            Some(i) => i,
+            None => {
+                unsafe { asm!("sti") };
+                return 0;
+            }
+        };
 
-    // If no actual change, keep running current process.
-    if cur == Some(ns) {
-        return 0;
-    }
+        // If no actual change, keep running current process.
+        if cur == Some(ns) {
+            unsafe { asm!("sti") };
+            return 0;
+        }
 
-    // We are switching processes now (do heavier work only on switch).
-    let _old = cur;
-    scheduler::set_current_idx(Some(ns));
+        // We are switching processes now (do heavier work only on switch).
+        log!("timer: about to schedule\r\n");
+        let _old = cur;
+        scheduler::set_current_idx(Some(ns));
 
-    // Update IST only when we switch.
-    let tss = &mut *TSS.as_mut_ptr();
-    tss.interrupt_stack_table[0] = VirtAddr::new(graph().procs[ns].kernel_stack_top);
+        // Update IST only when we switch.
+        let tss = &mut *TSS.as_mut_ptr();
+        tss.interrupt_stack_table[0] = VirtAddr::new(graph().procs[ns].kernel_stack_top);
 
-    // Switch address space.
-    paging::switch_cr3(graph().procs[ns].aspace.cr3);
-    log!("timer: switched to pid {}\r\n", graph().procs[ns].id);
+        // Switch address space.
+        paging::switch_cr3(graph().procs[ns].aspace.cr3);
+        log!("timer: switched to pid {}\r\n", graph().procs[ns].id);
 
-    // Compute the incoming frame pointer:
-    // - Prefer the process's last saved trap-frame pointer stored in `context.rsp` (set on preemption).
-    // - Otherwise fall back to the creation-time `saved_rsp` (set during process init only).
-    let mut next_rsp = graph().procs[ns].context.rsp;
-    if next_rsp == 0 {
-        next_rsp = graph().procs[ns].saved_rsp;
-    }
+        // Compute the incoming frame pointer:
+        // - Prefer the process's last saved trap-frame pointer stored in `context.rsp` (set on preemption).
+        // - Otherwise fall back to the creation-time `saved_rsp` (set during process init only).
+        let mut next_rsp = graph().procs[ns].context.rsp;
+        if next_rsp == 0 {
+            next_rsp = graph().procs[ns].saved_rsp;
+        }
 
-    // Keep state updates light; avoid extra work in ISR.
-    graph().procs[ns].state = NodeState::Running;
-    next_rsp
+        // Keep state updates light; avoid extra work in ISR.
+        graph().procs[ns].state = NodeState::Running;
+        let ret = next_rsp;
+        unsafe { asm!("sti") };
+        ret
+    })
 }
 
 extern "x86-interrupt" fn page_fault_handler(_frame: InterruptStackFrame, _error: PageFaultErrorCode) {
     let addr = Cr2::read().as_u64();
     let err = _error.bits();
 
-    // 1) Kernel heap faults: demand-map into kernel page tables, no user-space involvement.
+    // 1) Kernel heap faults: demand-map or upgrade permissions
     if memory::layout::in_kernel_heap_range(addr) {
-        log!(
-            "PF: kernel-heap cr2={:#x} err={:#x} cr3={:#x}\r\n",
-            addr,
-            err,
-            unsafe { KERNEL_CR3 }
-        );
         let page = addr & !0xFFFu64;
         let hhdm = unsafe { HHDM_OFFSET };
 
-        // If already mapped, we're done (avoid infinite fault loops).
         if paging::is_page_present(unsafe { KERNEL_CR3 }, hhdm, page) {
-            return;
+            // Page exists but write faulted → force writable bit
+            log!("PF: kernel-heap page present but not writable - forcing writable bit\r\n");
+            if paging::set_page_writable(unsafe { KERNEL_CR3 }, hhdm, page, true) {
+                log!("PF: kernel-heap successfully upgraded to writable\r\n");
+                return;
+            } else {
+                log!("PF: kernel-heap failed to upgrade writable bit\r\n");
+            }
+        } else {
+            log!("PF: kernel-heap mapping new page {:#x}...\r\n", page);
+            if let Some(phys) = paging::alloc_frame_phys() {
+                unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096); }
+                if paging::map_page_ex(unsafe { KERNEL_CR3 }, hhdm, page, phys, true, false, false) {
+                    HEAP_PAGES_MAPPED.fetch_add(1, Ordering::Relaxed);
+                    log!(
+                        "PF: kernel-heap SUCCESS mapped page {:#x} (total: {})\r\n",
+                        page,
+                        HEAP_PAGES_MAPPED.load(Ordering::Relaxed)
+                    );
+                    return;
+                }
+            }
         }
 
-        // Demand-map the missing heap page into the kernel page tables (NX, supervisor, writable).
-        let phys = match paging::alloc_frame_phys() {
-            Some(p) => p,
-            None => {
-                log!(
-                    "PF: kernel-heap OOM mapping page={:#x} (HALT)\r\n",
-                    page
-                );
-                hcf();
-            }
-        };
-        unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096) };
-        if !paging::map_page_ex(unsafe { KERNEL_CR3 }, hhdm, page, phys, true, false, false) {
-            log!(
-                "PF: kernel-heap map_page_ex failed page={:#x} phys={:#x} (HALT)\r\n",
-                page,
-                phys
-            );
-            hcf();
-        }
-        HEAP_PAGES_MAPPED.fetch_add(1, Ordering::Relaxed);
-        return;
+        log!("PF: kernel-heap mapping/upgrade failed - halting\r\n");
+        hcf();
     }
 
     let proc = match scheduler::current_process_mut() {
@@ -1747,6 +1756,9 @@ fn full_boot() -> ! {
 
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
+    // Very early debug: ensure COM1 is initialized before any heap/paging/logging.
+    serial_init();
+    serial_write("K1 - Kernel entry\r\n");
     full_boot();
 }
 

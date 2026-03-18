@@ -9,6 +9,7 @@ $(call USER_VARIABLE,KARCH,x86_64)
 override IMAGE_NAME := ts-os-$(KARCH)
 ISO := $(IMAGE_NAME).iso
 DISK_IMG := disk.img
+QEMU := /mingw64/bin/qemu-system-x86_64.exe
 
 .PHONY: all
 all: $(ISO)
@@ -25,17 +26,16 @@ test: $(IMAGE_NAME).iso $(DISK_IMG)
 
 .PHONY: run
 run: $(ISO) $(DISK_IMG)
-	qemu-system-x86_64 -cdrom $(ISO) \
+	$(QEMU) -cdrom $(ISO) \
 	  -drive file=$(DISK_IMG),format=raw \
 	  -m 2G -smp 2
 
 .PHONY: run-debug
 run-debug: $(ISO) $(DISK_IMG)
-	qemu-system-x86_64 -cdrom $(ISO) \
+	$(QEMU) -cdrom $(ISO) \
 	  -drive file=$(DISK_IMG),format=raw \
-	  -m 2G -smp 2 \
+	  -m 2G \
 	  -serial stdio \
-	  -d guest_errors,int,unimp \
 	  -no-reboot -no-shutdown
 
 .PHONY: run-debug-log
