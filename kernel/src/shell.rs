@@ -24,6 +24,7 @@ const SYS_CHDIR: u64 = 17;
 const SYS_GETCWD: u64 = 18;
 const SYS_WAIT: u64 = 19;
 const SYS_KILL: u64 = 20;
+const SYS_EXECVE: u64 = 21;
 
 fn syscall0(n: u64) -> u64 {
     let ret: u64;
@@ -132,6 +133,10 @@ fn do_getcwd(buf: &mut [u8]) -> usize {
 
 fn do_wait() -> u64 {
     syscall0(SYS_WAIT)
+}
+
+fn do_execve(path: &str) -> bool {
+    syscall2(SYS_EXECVE, path.as_ptr() as u64, path.len() as u64) == 0
 }
 
 fn do_kill(pid: u32, sig: u32) -> bool {
@@ -287,21 +292,21 @@ fn show_welcome_screen() {
     do_clear_screen();
     do_write("\r\n");
     do_write("  ==========================================\r\n");
-    do_write("            T S - O S\r\n");
+    do_write("       T S - O S   Strongest Node OS\r\n");
     do_write("  ==========================================\r\n");
     do_write("\r\n");
     do_write("  A living OS powered by the Strongest Node Framework.\r\n");
     do_write("  The kernel is the core; processes emerge from tension.\r\n");
     do_write("\r\n");
-    do_write("  Basic commands: help  ps  ls  cat  cd  pwd  rm  spawn\r\n");
+    do_write("  >>> CLICK THIS WINDOW TO TYPE <<<\r\n");
+    do_write("\r\n");
+    do_write("  Try: help  ps  ls  spawn  cat readme.txt\r\n");
     do_write("  Type 'help' for full command list.\r\n");
     do_write("\r\n");
-    do_write("  [Click this window and type. Status bar: nodes, act, tension]\r\n");
-    do_write("\r\n");
-    do_write("  Press any key or wait 4 seconds...\r\n");
+    do_write("  Press any key or wait 2 seconds...\r\n");
     do_write("\r\n");
 
-    const WAIT_TICKS: u32 = 400;
+    const WAIT_TICKS: u32 = 20;
     for _ in 0..WAIT_TICKS {
         if do_poll_key() {
             let mut discard = [0u8; 1];
@@ -404,6 +409,17 @@ fn run_cmd(line: &str, cwd: &str, out_buf: &mut [u8], out_redirect: Option<&str>
         args.get(i).map(|p| resolve_path(cwd, p)).unwrap_or_default()
     };
     match args[0] {
+        "exec" => {
+            let path = path_arg(1);
+            if path.is_empty() {
+                do_write("exec <path>\r\n");
+            } else if do_execve(&path) {
+                do_write("exec ok\r\n");
+            } else {
+                do_write("exec failed\r\n");
+            }
+            true
+        }
         "help" => {
             if let Some(cmd) = args.get(1) {
                 if show_cmd_help(cmd) {
@@ -662,14 +678,13 @@ fn parse_redirects(line: &str) -> (&str, Option<&str>, Option<&str>) {
 }
 
 pub fn shell_main() {
+    crate::vga::clear();
     let mut line_buf = [0u8; LINE_MAX];
     let mut out_buf = [0u8; 512];
     let mut history: [[u8; LINE_MAX]; HISTORY_MAX] = [[0; LINE_MAX]; HISTORY_MAX];
     let mut history_len = 0usize;
     let mut history_idx = 0usize;
     let mut cwd = String::from("/");
-
-    show_welcome_screen();
 
     loop {
         do_write("> ");

@@ -17,6 +17,11 @@ $(DISK_IMG):
 	fsutil file createnew $(DISK_IMG) 16777216 2>nul || \
 	(echo "Create disk.img: fsutil file createnew disk.img 16777216" && exit 1)
 
+.PHONY: test
+test: $(IMAGE_NAME).iso $(DISK_IMG)
+	@chmod +x scripts/smoke_test.sh 2>/dev/null || true
+	@./scripts/smoke_test.sh
+
 .PHONY: run
 run: $(IMAGE_NAME).iso $(DISK_IMG)
 	qemu-system-$(KARCH) -M q35 -cdrom $(IMAGE_NAME).iso -boot d \

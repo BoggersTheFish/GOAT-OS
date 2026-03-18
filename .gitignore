@@ -1,3 +1,21 @@
+# Build artifacts
+kernel/target/
+kernel/kernel
+*.iso
+iso_root/
+
+# Runtime artifacts
+disk.img
+debug-*.log
+
+# External deps
+limine/
+edk2-ovmf/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
 limine/
 edk2-ovmf/
 iso_root/

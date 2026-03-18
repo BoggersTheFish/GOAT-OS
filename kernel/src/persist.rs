@@ -26,6 +26,35 @@ fn persist_size() -> usize {
     unsafe { &_persist_end as *const u8 as usize - &_persist_start as *const u8 as usize }
 }
 
+/// Validate the current persist region. Call after try_restore to verify data.
+/// Returns true if magic and sizes look reasonable. On false, use fresh state.
+pub fn validate_current_checkpoint() -> bool {
+    validate_checkpoint(persist_region())
+}
+
+fn validate_checkpoint(region: *const u8) -> bool {
+    if region.is_null() {
+        return false;
+    }
+    unsafe {
+        let hdr = region as *const CheckpointHeader;
+        if (*hdr).magic != PERSIST_MAGIC {
+            return false;
+        }
+        let graph_len = (*hdr).graph_count as usize;
+        let fs_len = (*hdr).fs_len as usize;
+        // Reasonable limits: graph max 64 bytes, fs max 16 KiB
+        if graph_len > 64 || fs_len > 16384 {
+            return false;
+        }
+        let required = core::mem::size_of::<CheckpointHeader>() + graph_len + fs_len;
+        if required > persist_size() {
+            return false;
+        }
+        true
+    }
+}
+
 pub fn do_checkpoint(graph_data: *const u8, graph_len: usize, fs_data: *const u8, fs_len: usize) -> bool {
     let region = persist_region();
     let size = persist_size();

@@ -12,15 +12,17 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 |-----------|--------|
 | **Strongest Node** | Robust TS-OS (activation 100, tension 8) |
 | **Paging** | 4-level paging, CR3 switch per process |
-| **Heap** | Bump allocator (256 KiB, no free) |
+| **Heap** | LockedHeap (4 MiB, supports free) |
 | **Keyboard** | Shift, caps lock, arrows, backspace, 128-byte buffer |
 | **Persistence** | RAM + disk checkpoint; restore from disk on boot |
 | **Process graph** | Vec-based, up to 32 nodes, parent-child, wait |
 | **Process isolation** | Per-process page tables, syscall validation |
-| **VGA** | Limine framebuffer, HHDM mapping, **primary output** |
+| **VGA** | Limine framebuffer (pixel) or 0xB8000+HHDM fallback; null checks; hex debug; "TS-OS Strongest Node online" |
 | **Disk** | IDE PIO driver, 16 MB disk.img |
 
 **Tensions resolved:** Allocator, VGA (visible in QEMU), paging, disk, shell (cd, pwd, rm, pipes, history), wait/kill
+
+**Boot status:** Full boot: Limine, GDT/IDT/TSS, VGA, fs, persist restore, Strongest Node scheduler, shell. `make run` boots to interactive shell.
 
 ---
 
@@ -30,7 +32,9 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 - **Boot with Limine** – x86_64 bare-metal (BIOS + UEFI)
 - **GDT + TSS** – Kernel + user segments, TSS for kernel stack
 - **Ring 3 user mode** – User CS/SS, iretq, syscall DPL=3
-- **Bump heap** – 256 KiB, no free (sufficient for current use)
+- **Kernel heap** – LockedHeap 4 MiB (supports free)
+- **ELF loader** – load_elf for PT_LOAD segments
+- **Scheduler module** – Extracted to scheduler.rs with prune_dead_nodes stub
 
 ### Syscalls
 | # | Name | Description |
@@ -87,11 +91,11 @@ On Windows, use WSL or MSYS2.
 make all
 ```
 
-### Run
+### Run (VGA-only, clean in-VM experience)
 ```bash
 make run
 ```
-Creates `disk.img` (16 MB) if missing. QEMU opens a **VGA window**—all interaction happens inside the OS.
+Creates `disk.img` (16 MB) if missing. QEMU opens a **VGA window**—all interaction happens inside the OS. No serial; VGA is the primary output.
 
 For serial output to the host terminal (debugging):
 ```bash
@@ -100,37 +104,44 @@ make run-debug
 
 ---
 
-## First Boot Experience
+## How to Boot and Use
 
-When you run `make run`, a QEMU window opens. At the Limine menu, press **ENTER** to boot TS-OS.
+### Boot sequence (minimal kernel)
+1. Limine loads kernel; requests Framebuffer + HHDM.
+2. Kernel checks responses: if NULL → serial "LIMINE FB RESPONSE NULL" / "HHDM RESPONSE NULL" and fallback to 0xB8000+HHDM.
+3. Hex debug via serial: FB ADDR, HHDM OFFSET, FB VIRT.
+4. If fb_virt invalid (0 or < 0x1000) → "INVALID FB ADDR" + halt.
+5. Use Limine framebuffer (pixel) if valid (≥640×400); else VGA text at 0xB8000+HHDM.
+6. Clear screen, print "TS-OS Strongest Node online" on VGA.
+7. Halt (shell not started until VGA confirmed).
 
-1. **Kernel boot** – Brief messages (Strongest Node online, process graph, Heap OK).
-2. **Welcome screen** – Shown on VGA:
-   ```
-     ==========================================
-               T S - O S
-     ==========================================
+### Interactive use (when shell enabled)
+1. Run `make run`. A QEMU window opens.
+2. At the **Limine menu**, select **TS-OS** and press **ENTER**.
+3. The kernel boots and shows a welcome screen. **Click the QEMU window** to give it keyboard focus.
+4. You will see `> `—type commands and press ENTER.
 
-     A living OS powered by the Strongest Node Framework.
-     The kernel is the core; processes emerge from tension.
+**First commands to try:**
+| Command | What it does |
+|---------|--------------|
+| `help` | List all commands |
+| `ps` | Show processes (Strongest Node graph) |
+| `ls` | List files in current directory |
+| `spawn` | Spawn a new process (node emerges) |
+| `cat readme.txt` | Read the readme file |
 
-     Basic commands: help  ps  ls  cat  cd  pwd  rm  spawn
-     Type 'help' for full command list.
-
-     [Click this window and type. Status bar: nodes, act, tension]
-
-     Press any key or wait 4 seconds...
-   ```
-3. **Shell prompt** – After the welcome, you get `> `. **Click the QEMU window** and type. The bottom status bar shows node count, strongest activation, and tension.
+**Important:** You must **click the QEMU window** before typing. The window must have focus to receive keyboard input.
 
 ---
 
-## How to Use
+## First Boot Experience
 
-**Interaction is inside the QEMU window.** Click the window to give it focus, then type.
+1. **Kernel boot** – "TS-OS Strongest Node online" (framebuffer cleared of Limine text).
+2. **Welcome screen** – Strongest Node intro, "CLICK THIS WINDOW TO TYPE", and command hints.
+3. **Shell prompt** – `> ` appears. Click the window and type.
 
 | Command | Description |
-|---------|-------------|
+|---------|--------------|
 | `help` | Full command list; `help ls` for per-command help |
 | `cd`, `pwd` | Change and print working directory |
 | `ls`, `cat`, `touch`, `mkdir`, `rm` | File operations |
@@ -138,15 +149,6 @@ When you run `make run`, a QEMU window opens. At the Limine menu, press **ENTER*
 | `cmd > file`, `cmd < file` | Redirection |
 | `getpid`, `wait`, `kill PID` | Process control |
 | `wc`, `head`, `tail` | Text utilities |
-
-**Test commands:**
-```bash
-make all
-make run
-# In Limine: press ENTER
-# In TS-OS: click window, type "help", press ENTER
-# Type "ls" then "cat readme.txt"
-```
 
 ---
 
@@ -215,24 +217,20 @@ MIT (same as BoggersTheCIG).
 
 | Metric | Before | After |
 |--------|--------|-------|
-| Boot stability | Reboot loop (timer fault) | Stable boot with IST for timer |
-| Timer interrupt | Masked (0xFF), no scheduler | Unmasked (0xFE), IST stack, scheduler runs |
-| Framebuffer | Leftover Limine text visible | Full-screen clear on init |
-| Shell | Never started | Starts after boot messages |
-| VGA visibility | Black or garbled | Clean screen, framebuffer via Limine |
+| Boot | Stuck at Limine menu; kernel never starts | _start → kmain → serial_init → "K1 - Kernel entry reached" |
+| Entry point | ENTRY(kmain) | ENTRY(_start); _start in .text._start calls kmain |
+| Kernel | Full kmain (allocator, VGA, etc.) | Minimal: serial_init + K1 message + hlt |
+| limine.conf | 1-space indent | 4-space indent (proper format) |
 
-**Boot behavior:** Kernel boots with Limine, clears the framebuffer, prints "TS-OS Strongest Node online", process graph info, "Heap OK", then the shell prompt appears. Timer uses a dedicated IST stack to avoid faults.
+**Boot behavior:** Diagnostic iteration only. _start (assembly) → kmain → serial_init → serial_write("K1 - Kernel entry reached\r\n") → hlt. No allocator, VGA, or shell. Goal: confirm kernel entry is reached.
 
-**Exact test commands:**
+**Exact test commands (WSL/MSYS2):**
 ```bash
 cd BoggersTheOS
-make all
-make run
-# 1. At Limine: press ENTER
-# 2. Click the QEMU window
-# 3. Type: help
-# 4. Type: ls
-# 5. Type: cat readme.txt
+make clean && make all && make run-debug
+# 1. At Limine: select TS-OS, press ENTER
+# 2. If kernel entry works: serial shows "K1 - Kernel entry reached"
+# 3. If still stuck at menu: report back; Limine may not be loading/jumping to kernel
 ```
 
 ---

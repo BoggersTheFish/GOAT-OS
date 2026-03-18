@@ -30,6 +30,43 @@ unsafe fn inb(port: u16) -> u8 {
     ret
 }
 
+#[inline(always)]
+unsafe fn outb(port: u16, byte: u8) {
+    core::arch::asm!("out dx, al", in("dx") port, in("al") byte, options(nostack, preserves_flags));
+}
+
+/// Initialize PS/2 keyboard: enable scanning so it sends scan codes.
+/// Call once during boot. Does not touch framebuffer or other subsystems.
+pub fn init() {
+    unsafe {
+        // Flush any stale data from controller buffer
+        for _ in 0..8 {
+            if (inb(STATUS) & 1) != 0 {
+                let _ = inb(DATA);
+            } else {
+                break;
+            }
+        }
+        // Wait for controller ready to receive (input buffer empty)
+        for _ in 0..0x10000 {
+            if (inb(STATUS) & 2) == 0 {
+                break;
+            }
+        }
+        // Enable scanning (0xF4) - keyboard will send scan codes
+        outb(DATA, 0xF4);
+        // Flush ACK/responses so poll() doesn't see them as keypresses
+        for _ in 0..0x10000 {
+            if (inb(STATUS) & 1) != 0 {
+                let b = inb(DATA);
+                if b == 0xFA {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn scancode_to_ascii(sc: u8, shifted: bool) -> Option<u8> {
     const LOWER: [u8; 58] = [
         0, 0, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', 0x08, 0,

@@ -20,6 +20,11 @@ static mut FB_PITCH: usize = 0;
 static mut FB_BPP: u16 = 0;
 static mut VGA_ENABLED: bool = false;
 
+/// VGA text mode at 0xB8000 (80x25, 16-bit cells). Fallback when Limine framebuffer unavailable.
+const VGA_TEXT_BASE: u64 = 0xB8000;
+static mut TEXT_MODE_ADDR: *mut u16 = core::ptr::null_mut();
+static mut TEXT_MODE: bool = false;
+
 /// 8x8 font (font8x8_basic, public domain)
 const FONT: [[u8; 8]; 128] = [
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
@@ -158,8 +163,21 @@ pub fn init() {
     }
 }
 
+fn check_fb_safe() {
+    unsafe {
+        if FB_ADDR.is_null() || (FB_ADDR as u64) < 0x1000 {
+            crate::serial_write("FB INVALID\r\n");
+            crate::hcf();
+        }
+    }
+}
+
 pub fn init_framebuffer(addr: *mut u8, width: u64, height: u64, pitch: u64, bpp: u16) {
-    if addr.is_null() || width < (COLS * CHAR_W) as u64 || height < (ROWS * CHAR_H) as u64 || bpp < 24 {
+    if addr.is_null() || (addr as u64) < 0x1000
+        || width < (COLS * CHAR_W) as u64
+        || height < (ROWS * CHAR_H) as u64
+        || bpp < 24
+    {
         return;
     }
     unsafe {
@@ -175,13 +193,31 @@ pub fn init_framebuffer(addr: *mut u8, width: u64, height: u64, pitch: u64, bpp:
 }
 
 pub fn is_enabled() -> bool {
-    unsafe { VGA_ENABLED && !FB_ADDR.is_null() }
+    unsafe { VGA_ENABLED && !FB_ADDR.is_null() || TEXT_MODE && !TEXT_MODE_ADDR.is_null() }
+}
+
+/// VGA text mode at 0xB8000 + HHDM. 16-bit cells: (0x0F00 | char).
+pub fn init_text_mode(hhdm_offset: u64) {
+    let addr = (VGA_TEXT_BASE.wrapping_add(hhdm_offset)) as *mut u16;
+    if addr.is_null() || (addr as u64) < 0x1000 {
+        crate::serial_write("FB INVALID\r\n");
+        crate::hcf();
+    }
+    unsafe {
+        TEXT_MODE_ADDR = addr;
+        TEXT_MODE = true;
+        // Clear 80x25 cells with 16-bit format (0x0F00 | ' ')
+        for i in 0..(80 * 25) {
+            *TEXT_MODE_ADDR.add(i) = 0x0F00 | b' ' as u16;
+        }
+    }
 }
 
 fn draw_char(c: u8, col: usize, row: usize) {
-    if !unsafe { VGA_ENABLED } || unsafe { FB_ADDR.is_null() } {
+    if !unsafe { VGA_ENABLED } {
         return;
     }
+    check_fb_safe();
     let glyph = &FONT[(c as usize).min(127)];
     let bytes_per_pixel = (unsafe { FB_BPP } as usize + 7) / 8;
     let fg = 0x00FFFFFFu32;
@@ -201,12 +237,11 @@ fn draw_char(c: u8, col: usize, row: usize) {
                 }
                 let pixel = if (row_bits & (1 << (7 - dx))) != 0 { fg } else { bg };
                 let offset = fb_y * FB_PITCH + fb_x * bytes_per_pixel;
-                if bytes_per_pixel >= 4 {
-                    if offset + 4 <= FB_PITCH * FB_HEIGHT {
-                        let ptr = FB_ADDR.add(offset) as *mut u32;
-                        *ptr = pixel;
-                    }
-                } else if offset + 3 <= FB_PITCH * FB_HEIGHT {
+                let total = FB_PITCH * FB_HEIGHT;
+                if offset + 4 <= total && bytes_per_pixel >= 4 {
+                    let ptr = FB_ADDR.add(offset) as *mut u32;
+                    *ptr = pixel;
+                } else if offset + 3 <= total && bytes_per_pixel >= 3 {
                     let ptr = FB_ADDR.add(offset);
                     *ptr.add(0) = (pixel >> 0) as u8;
                     *ptr.add(1) = (pixel >> 8) as u8;
@@ -219,9 +254,10 @@ fn draw_char(c: u8, col: usize, row: usize) {
 
 /// Clear entire framebuffer (removes bootloader artifacts).
 fn clear_full_screen() {
-    if !unsafe { VGA_ENABLED } || unsafe { FB_ADDR.is_null() } {
+    if !unsafe { VGA_ENABLED } {
         return;
     }
+    check_fb_safe();
     let total_bytes = unsafe { FB_PITCH * FB_HEIGHT };
     unsafe {
         core::ptr::write_bytes(FB_ADDR, 0, total_bytes);
@@ -229,6 +265,18 @@ fn clear_full_screen() {
 }
 
 pub fn clear() {
+    if unsafe { TEXT_MODE } {
+        unsafe {
+            if !TEXT_MODE_ADDR.is_null() {
+                for i in 0..(80 * 25) {
+                    *TEXT_MODE_ADDR.add(i) = 0x0F00 | b' ' as u16;
+                }
+            }
+        }
+        ROW.store(0, Ordering::SeqCst);
+        COL.store(0, Ordering::SeqCst);
+        return;
+    }
     if !unsafe { VGA_ENABLED } {
         return;
     }
@@ -323,6 +371,20 @@ pub fn update_status_bar(nodes: usize, act: u32, tension: u32) {
     if !is_enabled() {
         return;
     }
+    if unsafe { TEXT_MODE } {
+        // Status bar in text mode: write to row 24
+        let s = crate::alloc::format!(" nodes:{} act:{} ten:{} ", nodes, act, tension);
+        let bytes = s.as_bytes();
+        unsafe {
+            for (col, &b) in bytes.iter().take(COLS).enumerate() {
+                *TEXT_MODE_ADDR.add(STATUS_ROW * COLS + col) = 0x0F00 | (b as u16);
+            }
+            for col in bytes.len()..COLS {
+                *TEXT_MODE_ADDR.add(STATUS_ROW * COLS + col) = 0x0F00 | b' ' as u16;
+            }
+        }
+        return;
+    }
     let s = crate::alloc::format!(" nodes:{} act:{} ten:{} ", nodes, act, tension);
     let bytes = s.as_bytes();
     for (col, &b) in bytes.iter().take(COLS).enumerate() {
@@ -333,10 +395,63 @@ pub fn update_status_bar(nodes: usize, act: u32, tension: u32) {
     }
 }
 
+fn write_byte_text_mode(b: u8) {
+    if !unsafe { TEXT_MODE } || unsafe { TEXT_MODE_ADDR.is_null() } {
+        return;
+    }
+    if (unsafe { TEXT_MODE_ADDR } as u64) < 0x1000 {
+        crate::serial_write("FB INVALID\r\n");
+        crate::hcf();
+    }
+    match b {
+        b'\n' => {
+            let r = ROW.load(Ordering::SeqCst);
+            if r + 1 >= CONTENT_ROWS {
+                // Scroll: copy rows 1..24 to 0..23
+                unsafe {
+                    for row in 0..(CONTENT_ROWS - 1) {
+                        for col in 0..COLS {
+                            let src = (row + 1) * COLS + col;
+                            let dst = row * COLS + col;
+                            *TEXT_MODE_ADDR.add(dst) = *TEXT_MODE_ADDR.add(src);
+                        }
+                    }
+                    for col in 0..COLS {
+                        *TEXT_MODE_ADDR.add((CONTENT_ROWS - 1) * COLS + col) = 0x0F00 | b' ' as u16;
+                    }
+                }
+            } else {
+                ROW.store(r + 1, Ordering::SeqCst);
+            }
+            COL.store(0, Ordering::SeqCst);
+        }
+        b'\r' => COL.store(0, Ordering::SeqCst),
+        _ => {
+            let r = ROW.load(Ordering::SeqCst);
+            let c = COL.load(Ordering::SeqCst);
+            if c >= COLS {
+                write_byte_text_mode(b'\n');
+                write_byte_text_mode(b);
+                return;
+            }
+            unsafe {
+                let cell = (0x0F00u16) | (b as u16);
+                *TEXT_MODE_ADDR.add(r * COLS + c) = cell;
+            }
+            COL.store(c + 1, Ordering::SeqCst);
+        }
+    }
+}
+
 pub fn write_byte(b: u8) {
+    if unsafe { TEXT_MODE } {
+        write_byte_text_mode(b);
+        return;
+    }
     if !unsafe { VGA_ENABLED } {
         return;
     }
+    check_fb_safe();
     match b {
         b'\n' => newline(),
         b'\r' => COL.store(0, Ordering::SeqCst),
