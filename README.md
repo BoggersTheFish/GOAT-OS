@@ -199,7 +199,7 @@ BoggersTheOS/
 - Bump allocator (256 KiB)
 - VGA + serial output, keyboard + serial input
 - Disk persistence (checkpoint to disk.img)
-- Shell: cd, pwd, rm, pipes, redirection, history, getpid, wait, kill
+- Shell: cd, pwd, rm, pipes, redirection, history, getpid, wait, kill (depends on stable PIT IRQ0 preemption; currently DF/HCF on timer storms)
 - Utilities: wc, head, tail; help &lt;cmd&gt;
 - Parent-child process tracking, wait for child exit
 
