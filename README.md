@@ -12,11 +12,11 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 |-----------|--------|
 | **Strongest Node** | Robust TS-OS (activation 100, tension 8) |
 | **Paging** | 4-level paging, CR3 switch per process |
-| **Heap** | LockedHeap (4 MiB, supports free) |
+| **Heap** | `linked_list_allocator::LockedHeap` (demand-mapped via #PF) |
 | **Keyboard** | Shift, caps lock, arrows, backspace, 128-byte buffer |
 | **Persistence** | RAM + disk checkpoint; restore from disk on boot |
 | **Process graph** | Vec-based, up to 32 nodes, parent-child, wait |
-| **Process isolation** | Per-process page tables, syscall validation |
+| **Process isolation** | Per-process page tables (CR3), user VMAs + demand paging |
 | **VGA** | Limine framebuffer (pixel) or 0xB8000+HHDM fallback; null checks; hex debug; "TS-OS Strongest Node online" |
 | **Disk** | IDE PIO driver, 16 MB disk.img |
 
@@ -32,8 +32,9 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 - **Boot with Limine** – x86_64 bare-metal (BIOS + UEFI)
 - **GDT + TSS** – Kernel + user segments, TSS for kernel stack
 - **Ring 3 user mode** – User CS/SS, iretq, syscall DPL=3
-- **Kernel heap** – LockedHeap 4 MiB (supports free)
-- **ELF loader** – load_elf for PT_LOAD segments
+- **Kernel heap** – demand-mapped heap region in upper-half VA space
+- **ELF loader** – demand-friendly PT_LOAD mapping (VMAs + file-backed pages only)
+- **execve (in-place)** – loads ELF into fresh CR3/AddressSpace, installs user stack VMA, patches iret frame
 - **Scheduler module** – Extracted to scheduler.rs with prune_dead_nodes stub
 
 ### Syscalls
@@ -70,7 +71,7 @@ TS-OS is a bare-metal x86_64 microkernel that directly instantiates the **Strong
 ### Drivers
 - **VGA** – Limine framebuffer, 8×8 font, 80×25 text grid, status bar (nodes/act/tension). Primary output.
 - **PS/2 keyboard** – Shift, caps lock, arrows, backspace. Primary input.
-- **Serial** – COM1 (optional; use `make run-debug` for serial to host terminal)
+- **Serial** – COM1 + early `log!()` macro (safe from interrupt context); use `make run-debug` for host-visible tracing
 
 ### Filesystem
 - **In-RAM tree** – mkdir, touch, read, write, list
@@ -101,6 +102,12 @@ For serial output to the host terminal (debugging):
 ```bash
 make run-debug
 ```
+
+#### Debugging execve / user-mode bringup
+- Use `make run-debug` and watch serial for:
+  - `execve:` step-by-step trace (file read → new CR3 → load ELF → stack mapping → switch_cr3 → iret patch)
+  - `PF:` page-fault classification (kernel-heap vs user VMA vs invalid) with CR2 + error bits
+  - `timer:` context switch announcements when preemption switches processes
 
 ---
 
@@ -176,7 +183,8 @@ BoggersTheOS/
 
 - **Keyboard** – US QWERTY scancode set 1 only; click the QEMU window to give it focus before typing
 - **VGA** – Framebuffer via Limine; if the window stays black, try `make run-debug` and use serial
-- **No fork/exec** – Spawn only; no ELF loader
+- **fork** – not implemented yet
+- **execve** – implemented, but user program bringup is still under active debug
 - **No networking** – No TCP/IP stack
 - **No fd table** – open/close/read/write via path, not fd
 

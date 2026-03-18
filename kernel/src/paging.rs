@@ -10,8 +10,22 @@ const PRESENT: u64 = 1;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const HUGE: u64 = 1 << 7;
+const NX: u64 = 1u64 << 63;
 
 type Table = [u64; ENTRY_COUNT];
+
+/// Cached HHDM offset (set at boot).
+static mut HHDM_OFFSET: u64 = 0;
+
+/// Set the HHDM offset (boot-time).
+pub unsafe fn set_hhdm_offset(offset: u64) {
+    HHDM_OFFSET = offset;
+}
+
+/// Get the HHDM offset.
+pub fn hhdm_offset() -> u64 {
+    unsafe { HHDM_OFFSET }
+}
 
 /// Global physical frame allocator (initialized at boot).
 static mut FRAME_ALLOC: Option<BitmapFrameAllocator> = None;
@@ -25,8 +39,28 @@ fn alloc_phys_frame() -> Option<Frame> {
     unsafe { FRAME_ALLOC.as_mut()?.alloc_frame() }
 }
 
+/// Allocate a physical 4KiB frame and return its physical address.
+/// Safe to call from page fault handler (does not use heap).
+pub fn alloc_frame_phys() -> Option<u64> {
+    Some(alloc_phys_frame()?.phys)
+}
+
+/// Deallocate a physical 4KiB frame previously returned by `alloc_frame_phys`.
+pub fn dealloc_frame_phys(phys: u64) {
+    unsafe {
+        if let Some(a) = FRAME_ALLOC.as_mut() {
+            a.dealloc_frame(Frame { phys });
+        }
+    }
+}
+
 /// Map a physical frame at virtual address in the given page table.
 pub fn map_page(cr3: u64, hhdm: u64, virt: u64, phys: u64, writable: bool, user: bool) -> bool {
+    map_page_ex(cr3, hhdm, virt, phys, writable, user, true)
+}
+
+/// Map a physical frame with explicit executable flag.
+pub fn map_page_ex(cr3: u64, hhdm: u64, virt: u64, phys: u64, writable: bool, user: bool, executable: bool) -> bool {
     let pml4_virt = (cr3 + hhdm) as *mut Table;
     let p4_idx = ((virt >> 39) & 0x1FF) as usize;
     let p3_idx = ((virt >> 30) & 0x1FF) as usize;
@@ -62,7 +96,10 @@ pub fn map_page(cr3: u64, hhdm: u64, virt: u64, phys: u64, writable: bool, user:
             core::ptr::write_bytes(p1_virt as *mut u8, 0, PAGE_SIZE);
         }
         let p1 = &mut *(((p2[p2_idx] & !0xFFF) + hhdm) as *mut Table);
-        let flags = PRESENT | (if writable { WRITABLE } else { 0 }) | (if user { USER } else { 0 });
+        let flags = PRESENT
+            | (if writable { WRITABLE } else { 0 })
+            | (if user { USER } else { 0 })
+            | (if executable { 0 } else { NX });
         p1[p1_idx] = (phys & !0xFFF) | flags;
     }
     true
@@ -96,6 +133,36 @@ pub fn unmap_page(cr3: u64, hhdm: u64, virt: u64) -> Option<u64> {
         let prev = p1[p1_idx] & !0xFFF;
         p1[p1_idx] = 0;
         Some(prev)
+    }
+}
+
+/// Check whether a 4KiB page is currently mapped (PTE present).
+pub fn is_page_present(cr3: u64, hhdm: u64, virt: u64) -> bool {
+    let pml4_virt = (cr3 + hhdm) as *const Table;
+    let p4_idx = ((virt >> 39) & 0x1FF) as usize;
+    let p3_idx = ((virt >> 30) & 0x1FF) as usize;
+    let p2_idx = ((virt >> 21) & 0x1FF) as usize;
+    let p1_idx = ((virt >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        let pml4 = &*pml4_virt;
+        if pml4[p4_idx] & PRESENT == 0 {
+            return false;
+        }
+        let p3 = &*(((pml4[p4_idx] & !0xFFF) + hhdm) as *const Table);
+        if p3[p3_idx] & PRESENT == 0 {
+            return false;
+        }
+        let p2 = &*(((p3[p3_idx] & !0xFFF) + hhdm) as *const Table);
+        if p2[p2_idx] & PRESENT == 0 {
+            return false;
+        }
+        if p2[p2_idx] & HUGE != 0 {
+            // Mapped as huge page; treat as present.
+            return true;
+        }
+        let p1 = &*(((p2[p2_idx] & !0xFFF) + hhdm) as *const Table);
+        (p1[p1_idx] & PRESENT) != 0
     }
 }
 

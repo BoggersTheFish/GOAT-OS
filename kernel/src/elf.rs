@@ -1,7 +1,11 @@
 //! ELF64 loader for user binaries.
-//! Parses headers, loads PT_LOAD segments into address space via map_page.
+//! Parses headers, installs PT_LOAD VMAs, and maps/copies file-backed pages using frames.
 
 use crate::paging;
+use crate::memory::address_space::{AddressSpace, Vma};
+use crate::memory::layout;
+extern crate alloc;
+use alloc::vec::Vec;
 use core::ptr;
 
 const EI_MAG0: usize = 0;
@@ -16,6 +20,7 @@ const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
+const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PAGE_SIZE: u64 = 4096;
 
@@ -35,8 +40,26 @@ pub struct ElfLoadInfo {
     pub stack_top: u64,
 }
 
-/// Load ELF64 binary into address space. Maps PT_LOAD segments, returns entry point.
-pub fn load_elf(data: &[u8], cr3: u64, hhdm: u64) -> Result<ElfLoadInfo, ElfError> {
+#[inline]
+fn align_down(x: u64, a: u64) -> u64 {
+    x & !(a - 1)
+}
+
+#[inline]
+fn align_up(x: u64, a: u64) -> u64 {
+    (x + (a - 1)) & !(a - 1)
+}
+
+/// Load ELF64 binary into an `AddressSpace`.
+///
+/// P2.5: This loader must not allocate user backing pages from the kernel heap.
+/// Instead it:
+/// - installs a VMA for each PT_LOAD segment (covers full `p_memsz`)
+/// - maps only the file-backed portion (`p_filesz`) by allocating physical frames
+/// - copies bytes into frames via HHDM
+/// - leaves the remainder demand-paged by the #PF handler
+pub fn load_elf(aspace: &mut AddressSpace, data: &[u8]) -> Result<ElfLoadInfo, ElfError> {
+    let hhdm = paging::hhdm_offset();
     if data.len() < 64 {
         return Err(ElfError::InvalidMagic);
     }
@@ -69,8 +92,13 @@ pub fn load_elf(data: &[u8], cr3: u64, hhdm: u64) -> Result<ElfLoadInfo, ElfErro
         return Err(ElfError::InvalidPhdr);
     }
 
-    let base = if e_type == ET_DYN { 0 } else { 0 };
+    // For ET_EXEC, respect the preferred load address (p_vaddr as-is).
+    // For ET_DYN, we currently do not relocate (base=0), but keep the hook for future ASLR.
+    let base = 0u64;
     let entry = e_entry + base;
+
+    // Track mappings so we can roll back on partial failure (avoid leaking frames).
+    let mut mapped: Vec<(u64, u64)> = Vec::new(); // (virt_page, phys_frame)
 
     for i in 0..e_phnum {
         let phoff = e_phoff as usize + i as usize * 56;
@@ -84,8 +112,13 @@ pub fn load_elf(data: &[u8], cr3: u64, hhdm: u64) -> Result<ElfLoadInfo, ElfErro
         let p_flags = u32::from_le_bytes(data[phoff + 4..phoff + 8].try_into().unwrap());
         let p_offset = u64::from_le_bytes(data[phoff + 8..phoff + 16].try_into().unwrap());
         let p_vaddr = u64::from_le_bytes(data[phoff + 16..phoff + 24].try_into().unwrap()) + base;
+        let p_align = u64::from_le_bytes(data[phoff + 48..phoff + 56].try_into().unwrap());
         let p_filesz = u64::from_le_bytes(data[phoff + 32..phoff + 40].try_into().unwrap());
         let p_memsz = u64::from_le_bytes(data[phoff + 40..phoff + 48].try_into().unwrap());
+
+        if p_memsz < p_filesz {
+            return Err(ElfError::LoadFailed);
+        }
 
         let file_data_end = (p_offset + p_filesz) as usize;
         if file_data_end > data.len() {
@@ -93,41 +126,100 @@ pub fn load_elf(data: &[u8], cr3: u64, hhdm: u64) -> Result<ElfLoadInfo, ElfErro
         }
 
         let writable = (p_flags & PF_W) != 0;
+        let executable = (p_flags & PF_X) != 0;
 
-        let mut vaddr = p_vaddr;
-        let mut offset = 0u64;
-        while offset < p_memsz {
-            let layout = core::alloc::Layout::from_size_align(PAGE_SIZE as usize, PAGE_SIZE as usize).map_err(|_| ElfError::LoadFailed)?;
-            let ptr = unsafe { alloc::alloc::alloc(layout) };
-            if ptr.is_null() {
+        let align = core::cmp::max(PAGE_SIZE, if p_align == 0 { PAGE_SIZE } else { p_align });
+
+        // Install a VMA that covers the whole segment memory size (demand paging will fill gaps).
+        let seg_start = align_down(p_vaddr, align);
+        let seg_end = align_up(p_vaddr.saturating_add(p_memsz), align);
+        if seg_end > seg_start {
+            let vma = Vma::new(seg_start, seg_end - seg_start, writable, executable);
+            if !vma.is_user_sane() {
+                // rollback
+                for (va, phys) in mapped.drain(..) {
+                    let _ = paging::unmap_page(aspace.cr3, hhdm, va);
+                    paging::dealloc_frame_phys(phys);
+                }
                 return Err(ElfError::LoadFailed);
             }
-            unsafe { core::ptr::write_bytes(ptr, 0, PAGE_SIZE as usize) };
-            let phys = (ptr as u64).saturating_sub(hhdm);
-
-            if !paging::map_page(cr3, hhdm, vaddr, phys, writable, true) {
-                return Err(ElfError::LoadFailed);
+            // Reject overlapping VMAs.
+            for existing in &aspace.vmas {
+                let a0 = existing.start;
+                let a1 = existing.end();
+                let b0 = vma.start;
+                let b1 = vma.end();
+                if a0 < b1 && b0 < a1 {
+                    for (va, phys) in mapped.drain(..) {
+                        let _ = paging::unmap_page(aspace.cr3, hhdm, va);
+                        paging::dealloc_frame_phys(phys);
+                    }
+                    return Err(ElfError::LoadFailed);
+                }
             }
+            aspace.vmas.push(vma);
+        }
 
-            let copy_len = (PAGE_SIZE.min(p_memsz - offset)) as usize;
-            let file_start = (p_offset + offset) as usize;
-            if file_start < file_data_end {
-                let len = copy_len.min(file_data_end - file_start);
+        // Map+copy only the file-backed portion.
+        if p_filesz == 0 {
+            continue;
+        }
+
+        let file_va_start = p_vaddr;
+        let file_va_end = p_vaddr.saturating_add(p_filesz);
+        let map_start = align_down(file_va_start, align);
+        let map_end = align_up(file_va_end, align);
+
+        let mut page = map_start;
+        while page < map_end {
+            // Allocate a fresh physical frame for this page.
+            let phys = match paging::alloc_frame_phys() {
+                Some(p) => p,
+                None => {
+                    for (va, phys) in mapped.drain(..) {
+                        let _ = paging::unmap_page(aspace.cr3, hhdm, va);
+                        paging::dealloc_frame_phys(phys);
+                    }
+                    return Err(ElfError::LoadFailed);
+                }
+            };
+            unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, PAGE_SIZE as usize) };
+
+            // Compute the byte range within this page that comes from the file.
+            let page_data_start = core::cmp::max(file_va_start, page);
+            let page_data_end = core::cmp::min(file_va_end, page + PAGE_SIZE);
+            if page_data_end > page_data_start {
+                let in_page_off = (page_data_start - page) as usize;
+                let len = (page_data_end - page_data_start) as usize;
+                let file_off = (p_offset + (page_data_start - p_vaddr)) as usize;
+                if file_off + len > data.len() {
+                    return Err(ElfError::LoadFailed);
+                }
                 unsafe {
                     ptr::copy_nonoverlapping(
-                        data[file_start..file_start + len].as_ptr(),
-                        ptr,
+                        data[file_off..file_off + len].as_ptr(),
+                        ((phys + hhdm) as *mut u8).add(in_page_off),
                         len,
                     );
                 }
             }
 
-            vaddr += PAGE_SIZE;
-            offset += PAGE_SIZE;
+            // Map into the target process page tables (user=true, perms from segment flags).
+            if !paging::map_page_ex(aspace.cr3, hhdm, page, phys, writable, true, executable) {
+                paging::dealloc_frame_phys(phys);
+                for (va, phys) in mapped.drain(..) {
+                    let _ = paging::unmap_page(aspace.cr3, hhdm, va);
+                    paging::dealloc_frame_phys(phys);
+                }
+                return Err(ElfError::LoadFailed);
+            }
+            mapped.push((page, phys));
+
+            page += align;
         }
     }
 
-    let stack_top = 0x7FFF_FFFF_F000u64;
+    let stack_top = layout::USER_STACK_TOP;
 
     Ok(ElfLoadInfo { entry, stack_top })
 }

@@ -27,8 +27,10 @@ mod vfs;
 mod vga;
 mod fd_table;
 
-use scheduler::{NodeState, ProcessGraph, ProcessNode, CWD_MAX, MAX_NODES, PARENT_NONE, STACK_SIZE};
-use scheduler::{Vma, MAX_VMAS};
+use scheduler::{NodeState, ProcessGraph, CWD_MAX, MAX_NODES, PARENT_NONE};
+use process::Process;
+use process::TrapFrame;
+use memory::address_space::Vma;
 
 use alloc::boxed::Box;
 use alloc::string::ToString;
@@ -43,10 +45,15 @@ use x86_64::instructions::tables::load_tss;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::registers::model_specific::{Efer, EferFlags};
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::PrivilegeLevel;
 use x86_64::VirtAddr;
+use x86_64::instructions::interrupts;
 
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::fmt;
+use core::fmt::Write;
 #[used]
 #[unsafe(link_section = ".requests")]
 static BASE_REVISION: BaseRevision = BaseRevision::new();
@@ -87,7 +94,7 @@ const SYSCALL_VECTOR: u8 = 0x80;
 const KERNEL_STACK_SIZE: usize = 4096;
 
 static mut KERNEL_RSP: u64 = 0;
-static mut CURRENT_NODE_IDX: usize = 0xFF;
+// Current node index is owned by scheduler module now.
 static mut TICK_COUNT: u32 = 0;
 static mut HHDM_OFFSET: u64 = 0;
 static mut KERNEL_CR3: u64 = 0;
@@ -96,6 +103,70 @@ static mut KERNEL_CR3: u64 = 0;
 #[repr(align(4096))]
 struct FrameBitmap([u64; 262_144]);
 static mut FRAME_BITMAP: FrameBitmap = FrameBitmap([0; 262_144]);
+
+static mut GDT_STORE: MaybeUninit<GlobalDescriptorTable> = MaybeUninit::uninit();
+static mut IDT_STORE: MaybeUninit<InterruptDescriptorTable> = MaybeUninit::uninit();
+
+static NEEDS_RESCHEDULE: AtomicBool = AtomicBool::new(false);
+static HEAP_PAGES_MAPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Very small, interrupt-safe serial logger lock.
+static SERIAL_LOG_LOCK: AtomicBool = AtomicBool::new(false);
+static SERIAL_READY: AtomicBool = AtomicBool::new(false);
+
+struct SerialLogger;
+
+impl SerialLogger {
+    #[inline(always)]
+    fn lock() {
+        while SERIAL_LOG_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[inline(always)]
+    fn unlock() {
+        SERIAL_LOG_LOCK.store(false, Ordering::Release);
+    }
+}
+
+impl fmt::Write for SerialLogger {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        serial_write(s);
+        Ok(())
+    }
+}
+
+#[inline(always)]
+fn ensure_serial_ready() {
+    if SERIAL_READY.load(Ordering::Acquire) {
+        return;
+    }
+    // Safe to call multiple times; first successful caller flips SERIAL_READY.
+    serial_init();
+    SERIAL_READY.store(true, Ordering::Release);
+}
+
+#[inline(always)]
+pub(crate) fn log_args(args: fmt::Arguments) {
+    // Must be safe from interrupt context: avoid deadlock by disabling interrupts while locked.
+    interrupts::without_interrupts(|| {
+        ensure_serial_ready();
+        SerialLogger::lock();
+        let _ = SerialLogger.write_fmt(args);
+        SerialLogger::unlock();
+    });
+}
+
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        $crate::log_args(core::format_args!($($arg)*));
+    }};
+}
 
 core::arch::global_asm!(
     r#"
@@ -108,6 +179,7 @@ _start:
 
     .text
     .global syscall_stub
+    .global timer_stub
     .global double_fault_stub
     .global bootstrap_switch
     .global kernel_hlt_loop
@@ -156,6 +228,45 @@ syscall_stub:
     pop rax
     iretq
 
+timer_stub:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rdi, rsp
+    call timer_handler
+    cmp rax, 0
+    jz .no_switch_timer
+    mov rsp, rax
+.no_switch_timer:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
+
 bootstrap_switch:
     push 0x10
     lea rax, [rsp + 40]
@@ -179,140 +290,201 @@ kernel_hlt_loop:
 
 extern "C" {
     fn syscall_stub();
+    fn timer_stub();
     fn double_fault_stub();
     fn bootstrap_switch(shell_rsp: u64, kernel_rsp_addr: *mut u64) -> !;
 }
 
-extern "x86-interrupt" fn timer_handler_x86(frame: InterruptStackFrame) {
-    unsafe {
-        outb(PIC1_CMD, 0x20);
-        TICK_COUNT += 1;
-        if TICK_COUNT % 3000 == 0 && TICK_COUNT > 0 {
-            do_checkpoint();
-        }
-        let cur = if CURRENT_NODE_IDX != 0xFF {
-            Some(CURRENT_NODE_IDX)
-        } else {
-            None
-        };
-        let frame_ptr = &frame as *const _ as *mut u8;
-        if let Some(idx) = cur {
-            graph().nodes[idx].saved_rsp = frame_ptr as u64;
-            graph().nodes[idx].tension = graph().nodes[idx].tension.saturating_add(1);
-        } else {
-            KERNEL_RSP = frame_ptr as u64;
-        }
-        maybe_emerge_node();
-        let current = graph().select_strongest();
-        if let Some(c) = current {
-            graph().decay_all(c);
-            graph().spread_from(c);
-        }
-        let new_strongest = graph().select_strongest();
-        if TICK_COUNT % 10 == 0 {
-            if let Some(ns) = new_strongest {
-                vga::update_status_bar(graph().count(), graph().nodes[ns].activation, graph().nodes[ns].tension);
-            } else {
-                vga::update_status_bar(graph().count(), 0, 0);
-            }
-        }
-        if let Some(ns) = new_strongest {
-            graph().nodes[ns].state = NodeState::Running;
-            let do_switch = cur != Some(ns) || cur.is_none();
-            if do_switch {
-                CURRENT_NODE_IDX = ns;
-                // Update IST[0] to the selected node's kernel IST stack.
-                let tss = unsafe { &mut *TSS.as_mut_ptr() };
-                let top = VirtAddr::new(unsafe { &KERNEL_IST_STACKS[ns] as *const _ as u64 } + 4096);
-                tss.interrupt_stack_table[0] = top;
-                paging::switch_cr3(graph().nodes[ns].cr3);
-                let rsp = if graph().nodes[ns].saved_rsp != 0 {
-                    graph().nodes[ns].saved_rsp
-                } else {
-                    graph().nodes[ns].stack.as_ptr().add(STACK_SIZE - 40) as u64
-                };
-                switch_to_rsp(rsp);
-            }
-        } else {
-            paging::switch_cr3(KERNEL_CR3);
-        }
+#[no_mangle]
+pub unsafe extern "C" fn timer_handler(tf: &mut TrapFrame) -> u64 {
+    // Ack PIC + update tick quickly.
+    outb(PIC1_CMD, 0x20);
+    TICK_COUNT = TICK_COUNT.wrapping_add(1);
+
+    let cur = scheduler::current_idx();
+    if NEEDS_RESCHEDULE.swap(false, Ordering::AcqRel) {
+        scheduler::set_current_idx(None);
     }
+
+    // Save current process register state (typed) with minimal work.
+    if let Some(idx) = cur {
+        let p = &mut graph().procs[idx];
+        let mut ctx = process::ProcessContext::from_trap_frame(tf);
+        // Store the current kernel trap-frame pointer in `context.rsp` so we can resume without
+        // mutating legacy `saved_rsp` in the timer hot path.
+        ctx.rsp = tf as *mut TrapFrame as u64;
+        p.context = ctx;
+        p.node.tension = p.node.tension.saturating_add(1);
+    } else {
+        // No current user process selected; keep kernel RSP so yield path remains safe.
+        KERNEL_RSP = tf as *mut TrapFrame as u64;
+    }
+
+    // Minimal Strongest Node update to decide whether to switch.
+    if let Some(c) = graph().select_strongest() {
+        graph().decay_all(c);
+        graph().spread_from(c);
+    }
+    let ns = match graph().select_strongest() {
+        Some(i) => i,
+        None => return 0,
+    };
+
+    // If no actual change, keep running current process.
+    if cur == Some(ns) {
+        return 0;
+    }
+
+    // We are switching processes now (do heavier work only on switch).
+    let _old = cur;
+    scheduler::set_current_idx(Some(ns));
+
+    // Update IST only when we switch.
+    let tss = &mut *TSS.as_mut_ptr();
+    tss.interrupt_stack_table[0] = VirtAddr::new(graph().procs[ns].kernel_stack_top);
+
+    // Switch address space.
+    paging::switch_cr3(graph().procs[ns].aspace.cr3);
+    log!("timer: switched to pid {}\r\n", graph().procs[ns].id);
+
+    // Compute the incoming frame pointer:
+    // - Prefer the process's last saved trap-frame pointer stored in `context.rsp` (set on preemption).
+    // - Otherwise fall back to the creation-time `saved_rsp` (set during process init only).
+    let mut next_rsp = graph().procs[ns].context.rsp;
+    if next_rsp == 0 {
+        next_rsp = graph().procs[ns].saved_rsp;
+    }
+
+    // Keep state updates light; avoid extra work in ISR.
+    graph().procs[ns].state = NodeState::Running;
+    next_rsp
 }
 
 extern "x86-interrupt" fn page_fault_handler(_frame: InterruptStackFrame, _error: PageFaultErrorCode) {
     let addr = Cr2::read().as_u64();
+    let err = _error.bits();
 
-    // Canonical lower half: bit47 sign-extended; reject non-canonical and upper half
-    let canonical = ((addr >> 48) == 0) && ((addr >> 47) & 1 == 0);
-    let in_user = addr >= 0x1000 && addr <= 0x0000_7FFF_FFFF_FFFFu64;
+    // 1) Kernel heap faults: demand-map into kernel page tables, no user-space involvement.
+    if memory::layout::in_kernel_heap_range(addr) {
+        log!(
+            "PF: kernel-heap cr2={:#x} err={:#x} cr3={:#x}\r\n",
+            addr,
+            err,
+            unsafe { KERNEL_CR3 }
+        );
+        let page = addr & !0xFFFu64;
+        let hhdm = unsafe { HHDM_OFFSET };
 
-    if !canonical || !in_user {
-        prune_current_on_segv(addr);
+        // If already mapped, we're done (avoid infinite fault loops).
+        if paging::is_page_present(unsafe { KERNEL_CR3 }, hhdm, page) {
+            return;
+        }
+
+        // Demand-map the missing heap page into the kernel page tables (NX, supervisor, writable).
+        let phys = match paging::alloc_frame_phys() {
+            Some(p) => p,
+            None => {
+                log!(
+                    "PF: kernel-heap OOM mapping page={:#x} (HALT)\r\n",
+                    page
+                );
+                hcf();
+            }
+        };
+        unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096) };
+        if !paging::map_page_ex(unsafe { KERNEL_CR3 }, hhdm, page, phys, true, false, false) {
+            log!(
+                "PF: kernel-heap map_page_ex failed page={:#x} phys={:#x} (HALT)\r\n",
+                page,
+                phys
+            );
+            hcf();
+        }
+        HEAP_PAGES_MAPPED.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
-    // VMA check: must be covered by some VMA for this process
-    let idx = unsafe { CURRENT_NODE_IDX };
-    if idx == 0xFF {
-        prune_current_on_segv(addr);
-        return;
-    }
+    let proc = match scheduler::current_process_mut() {
+        Some(p) => p,
+        None => {
+            log!(
+                "PF: no-current-proc cr2={:#x} err={:#x} (prune)\r\n",
+                addr,
+                err
+            );
+            prune_on_segv(addr);
+            return;
+        }
+    };
 
-    let node = unsafe { &graph().nodes[idx] };
-    let mut ok = false;
-    for i in 0..node.vma_count.min(MAX_VMAS) {
-        if node.vmas[i].contains(addr) {
-            ok = true;
-            break;
+    // 2) User faults: canonical + within usable user range + covered by a VMA in current AddressSpace.
+    if memory::layout::is_canonical_user(addr) && memory::layout::in_user_usable_range(addr) {
+        let cr3 = proc.aspace.cr3;
+        if let Some(vma) = proc.aspace.covers_mut(addr) {
+            log!(
+                "PF: user cr2={:#x} err={:#x} pid={} cr3={:#x} vma=[{:#x}..{:#x}) w={} x={}\r\n",
+                addr,
+                err,
+                proc.id,
+                cr3,
+                vma.start,
+                vma.end(),
+                vma.write,
+                vma.exec
+            );
+            let page = addr & !0xFFFu64;
+            let hhdm = unsafe { HHDM_OFFSET };
+            if paging::is_page_present(cr3, hhdm, page) {
+                return;
+            }
+            if let Some(phys) = paging::alloc_frame_phys() {
+                unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096) };
+                let _ = paging::map_page_ex(cr3, hhdm, page, phys, vma.write, true, vma.exec);
+                // Activation bump: VMA is \"hot\" when it faults/gets touched.
+                vma.node.activation = vma.node.activation.saturating_add(4);
+                return;
+            }
+            prune_on_segv(addr);
+            return;
         }
     }
-    if !ok {
-        prune_current_on_segv(addr);
-        return;
-    }
 
-    // Demand map one page (present, user, writable per VMA if found)
-    let writable = node
-        .vmas
-        .iter()
-        .take(node.vma_count.min(MAX_VMAS))
-        .find(|v| v.contains(addr))
-        .map(|v| v.writable)
-        .unwrap_or(false);
-
-    let page = addr & !0xFFFu64;
-    // Allocate a physical frame via paging's allocator-backed table allocator and map it.
-    // For now we reuse alloc_frame inside paging::map_page path by allocating a frame via that allocator.
-    // We allocate a backing page using the global allocator (heap) then map its physical address.
-    let layout = Layout::from_size_align(4096, 4096).unwrap();
-    let ptr = unsafe { alloc::alloc::alloc(layout) };
-    if ptr.is_null() {
-        prune_current_on_segv(addr);
-        return;
-    }
-    unsafe { core::ptr::write_bytes(ptr, 0, 4096) };
-    let phys = (ptr as u64).saturating_sub(unsafe { HHDM_OFFSET });
-    let _ = paging::map_page(unsafe { graph().nodes[idx].cr3 }, unsafe { HHDM_OFFSET }, page, phys, writable, true);
+    // 3) Invalid access: prune/kill the current process node.
+    log!(
+        "PF: invalid cr2={:#x} err={:#x} pid={} cr3={:#x} canonical_user={} usable_user={} ctx.rip={:#x} ctx.rsp={:#x}\r\n",
+        addr,
+        err,
+        proc.id,
+        proc.aspace.cr3,
+        memory::layout::is_canonical_user(addr),
+        memory::layout::in_user_usable_range(addr),
+        proc.context.rip,
+        proc.context.rsp
+    );
+    prune_on_segv(addr);
 }
 
-fn prune_current_on_segv(addr: u64) {
-    console_write("Segmentation fault — node pruned due to invalid VA access\r\n");
-    serial_write("SEGV @ ");
-    serial_write_hex(addr);
-    serial_write("\r\n");
+fn prune_on_segv(addr: u64) {
+    log!("SEGV: addr={:#x}\r\n", addr);
+    console_write("Segmentation fault — node pruned due to invalid VA access at ");
+    console_write_hex(addr);
+    console_write("\r\n");
 
-    unsafe {
-        if CURRENT_NODE_IDX != 0xFF {
-            let idx = CURRENT_NODE_IDX;
-            graph().nodes[idx].activation = 0;
-            graph().nodes[idx].state = NodeState::Exited;
-            graph().nodes[idx].exit_status = 139; // 128+SIGSEGV
-            CURRENT_NODE_IDX = 0xFF;
+    if let Some(idx) = scheduler::current_idx() {
+        if let Some(p) = scheduler::current_process_mut() {
+            log!(
+                "SEGV: pruning pid={} idx={} act={} tens={}\r\n",
+                p.id,
+                idx,
+                p.node.activation,
+                p.node.tension
+            );
         }
+        scheduler::prune_process(idx, 139); // 128+SIGSEGV
     }
 
-    // Reschedule immediately by forcing a yield path
-    let _ = do_schedule(None);
+    // Defer the actual reschedule to the timer interrupt.
+    NEEDS_RESCHEDULE.store(true, Ordering::Release);
 }
 
 #[no_mangle]
@@ -346,8 +518,8 @@ static mut TIMER_STACK: TimerStack = TimerStack([0; 4096]);
 static mut TSS: MaybeUninit<TaskStateSegment> = MaybeUninit::uninit();
 
 #[repr(align(16))]
-struct KernelIstStack([u8; 4096]);
-static mut KERNEL_IST_STACKS: [KernelIstStack; MAX_NODES] = [const { KernelIstStack([0; 4096]) }; MAX_NODES];
+struct Ist0BootStack([u8; 4096]);
+static mut IST0_BOOT_STACK: Ist0BootStack = Ist0BootStack([0; 4096]);
 
 
 #[alloc_error_handler]
@@ -389,11 +561,23 @@ fn serial_init() {
         outb(LCR, 0x03);
         outb(FCR, 0xC7);
     }
+    SERIAL_READY.store(true, Ordering::Release);
+}
+
+#[inline(always)]
+fn serial_write_byte(b: u8) {
+    // Wait for transmitter holding register empty (LSR bit 5).
+    unsafe {
+        while (inb(LSR) & 0x20) == 0 {
+            core::hint::spin_loop();
+        }
+        outb(COM1, b);
+    }
 }
 
 pub(crate) fn serial_write(s: &str) {
     for b in s.bytes() {
-        unsafe { outb(COM1, b) };
+        serial_write_byte(b);
     }
 }
 
@@ -439,11 +623,51 @@ fn serial_write_hex(n: u64) {
     }
 }
 
+fn console_write_hex(n: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        let shift = 60 - (i * 4);
+        let nibble = ((n >> shift) & 0xF) as usize;
+        buf[2 + i] = HEX[nibble];
+    }
+    let s = unsafe { core::str::from_utf8_unchecked(&buf) };
+    console_write(s);
+}
 
-static mut GRAPH: Option<ProcessGraph> = None;
 
 fn graph() -> &'static mut ProcessGraph {
-    unsafe { GRAPH.as_mut().unwrap() }
+    scheduler::graph_mut()
+}
+
+fn map_process_kernel_stack(slot: usize) -> Option<(u64, u64)> {
+    let guard = memory::layout::kernel_stack_slot_base(slot);
+    let base = guard + memory::layout::KERNEL_STACK_GUARD_SIZE;
+    let top = memory::layout::kernel_stack_top(slot);
+
+    let hhdm = unsafe { HHDM_OFFSET };
+    let cr3 = unsafe { KERNEL_CR3 };
+
+    // Ensure guard page is unmapped.
+    let _ = paging::unmap_page(cr3, hhdm, guard);
+
+    let mut v = base;
+    while v < top {
+        if paging::is_page_present(cr3, hhdm, v) {
+            v += 4096;
+            continue;
+        }
+        let phys = paging::alloc_frame_phys()?;
+        unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096) };
+        if !paging::map_page_ex(cr3, hhdm, v, phys, true, false, false) {
+            return None;
+        }
+        v += 4096;
+    }
+
+    Some((base, top))
 }
 
 fn small_delay() {
@@ -537,11 +761,16 @@ unsafe fn pit_init() {
 
 #[no_mangle]
 unsafe extern "C" fn yield_to_kernel() {
-    let idx = CURRENT_NODE_IDX;
+    let idx = match scheduler::current_idx() {
+        Some(i) => i,
+        None => {
+            return;
+        }
+    };
     if idx == 0xFF {
         return;
     }
-    let node = &mut graph().nodes[idx];
+    let node = &mut graph().procs[idx];
     let rsp: u64;
     let rip: u64;
     asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags));
@@ -586,22 +815,33 @@ fn maybe_emerge_node() {
     // prune_dead_nodes would invalidate indices; defer until we have stable IDs
     let mut max_tension = 0u32;
     for i in 0..graph().count() {
-        if !matches!(graph().nodes[i].state, NodeState::Exited) {
-            max_tension = max_tension.max(graph().nodes[i].tension);
+        if !matches!(graph().procs[i].state, NodeState::Exited) {
+            max_tension = max_tension.max(graph().procs[i].node.tension);
         }
     }
     if max_tension > 30 && graph().count() < MAX_NODES {
         let next_id = graph().count() as u32;
-        let parent = unsafe {
-            if CURRENT_NODE_IDX != 0xFF {
-                CURRENT_NODE_IDX
-            } else {
-                PARENT_NONE
-            }
-        };
+        let parent = scheduler::current_idx().unwrap_or(PARENT_NONE);
         if let Some(idx) = graph().try_add_node(next_id, 50, 0, &[], parent) {
-            init_node_stacks_for(&mut graph().nodes[idx]);
-            graph().nodes[idx].state = NodeState::Ready;
+            init_node_stacks_for(&mut graph().procs[idx]);
+            // Default VMAs for new user node.
+            let code = Vma::new(
+                0x0000_0000_0040_0000,
+                0x0000_0000_0080_0000 - 0x0000_0000_0040_0000,
+                true,
+                true,
+            );
+            let stack_top = 0x0000_7FFF_FFFF_F000u64;
+            // Keep AddressSpace (owned by the process) in sync for #PF demand paging.
+            graph().procs[idx].aspace.vmas.clear();
+            graph().procs[idx].aspace.vmas.push(code);
+            graph().procs[idx].aspace.vmas.push(Vma::new(
+                stack_top - (8 * 1024 * 1024),
+                8 * 1024 * 1024,
+                true,
+                false,
+            ));
+            graph().procs[idx].state = NodeState::Ready;
         }
     }
 }
@@ -622,17 +862,16 @@ fn do_schedule(cur: Option<usize>) -> u64 {
     }
     let new_strongest = graph().select_strongest();
     if let Some(ns) = new_strongest {
-        graph().nodes[ns].state = NodeState::Running;
+        graph().procs[ns].state = NodeState::Running;
         let do_switch = cur != Some(ns) || cur.is_none();
         if do_switch {
-            unsafe {
-                CURRENT_NODE_IDX = ns;
-                paging::switch_cr3(graph().nodes[ns].cr3);
+            scheduler::set_current_idx(Some(ns));
+            unsafe { paging::switch_cr3(graph().procs[ns].aspace.cr3) };
+            if graph().procs[ns].saved_rsp != 0 {
+                return graph().procs[ns].saved_rsp;
             }
-            if graph().nodes[ns].saved_rsp != 0 {
-                return graph().nodes[ns].saved_rsp;
-            }
-            return unsafe { graph().nodes[ns].stack.as_ptr().add(STACK_SIZE - INIT_FRAME_SIZE) as u64 };
+            // Each process has a mapped kernel stack; saved_rsp is always initialized at creation.
+            return graph().procs[ns].saved_rsp;
         }
     } else {
         unsafe { paging::switch_cr3(KERNEL_CR3) };
@@ -641,16 +880,15 @@ fn do_schedule(cur: Option<usize>) -> u64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
-    let frame = frame_ptr as *const u64;
-    let syscall = *frame.add(0);
+pub unsafe extern "C" fn syscall_handler(tf: &mut TrapFrame) -> u64 {
+    let syscall = tf.syscall_number();
     match syscall {
         SYS_WRITE => {
-            let _fd = *frame.add(5);
-            let buf = *frame.add(4) as *const u8;
-            let len = *frame.add(3) as usize;
+            let _fd = tf.rdi;
+            let buf = tf.rsi as *const u8;
+            let len = tf.rdx as usize;
             if !validate_buf(buf, len) {
-                *(frame_ptr as *mut u64) = !0u64;
+                tf.rax = !0u64;
                 return 0;
             }
             for i in 0..len {
@@ -658,13 +896,13 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
                 vga::write_byte(b);
                 outb(COM1, b);
             }
-            *(frame_ptr as *mut u64) = len as u64;
+            tf.rax = len as u64;
             0
         }
         SYS_READ => {
-            let fd = *frame.add(5);
-            let buf = *frame.add(4) as *mut u8;
-            let len = *frame.add(3) as usize;
+            let fd = tf.rdi;
+            let buf = tf.rsi as *mut u8;
+            let len = tf.rdx as usize;
             let mut n = 0usize;
             if fd == 0 && len > 0 && validate_buf(buf, len) {
                 if let Some(c) = keyboard::read_byte().or_else(serial_read_byte) {
@@ -672,47 +910,53 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
                     n = 1;
                 }
             }
-            *(frame_ptr as *mut u64) = n as u64;
+            tf.rax = n as u64;
             0
         }
         SYS_YIELD => {
-            if CURRENT_NODE_IDX != 0xFF {
-                graph().nodes[CURRENT_NODE_IDX].saved_rsp = frame_ptr as u64;
+            if let Some(idx) = scheduler::current_idx() {
+                graph().procs[idx].saved_rsp = tf as *mut TrapFrame as u64;
             }
-            let cur = if CURRENT_NODE_IDX != 0xFF {
-                Some(CURRENT_NODE_IDX)
-            } else {
-                None
-            };
+            let cur = scheduler::current_idx();
             do_schedule(cur)
         }
         SYS_SPAWN => {
             let next_id = graph().count() as u32;
-            let frame_mut = frame_ptr as *mut u64;
-            let parent = if CURRENT_NODE_IDX != 0xFF {
-                CURRENT_NODE_IDX
-            } else {
-                PARENT_NONE
-            };
+            let parent = scheduler::current_idx().unwrap_or(PARENT_NONE);
             if let Some(idx) = graph().try_add_node(next_id, 50, 0, &[], parent) {
-                init_node_stacks_for(&mut graph().nodes[idx]);
-                graph().nodes[idx].state = NodeState::Ready;
-                *frame_mut.add(0) = idx as u64;
+                init_node_stacks_for(&mut graph().procs[idx]);
+                // Default VMAs for new user node.
+                let code = Vma::new(
+                    0x0000_0000_0040_0000,
+                    0x0000_0000_0080_0000 - 0x0000_0000_0040_0000,
+                    true,
+                    true,
+                );
+                let stack_top = 0x0000_7FFF_FFFF_F000u64;
+                // Keep AddressSpace (owned by the process) in sync for #PF demand paging.
+                graph().procs[idx].aspace.vmas.clear();
+                graph().procs[idx].aspace.vmas.push(code);
+                graph().procs[idx].aspace.vmas.push(Vma::new(
+                    stack_top - (8 * 1024 * 1024),
+                    8 * 1024 * 1024,
+                    true,
+                    false,
+                ));
+                graph().procs[idx].state = NodeState::Ready;
+                tf.rax = idx as u64;
             } else {
-                *frame_mut.add(0) = !0u64;
+                tf.rax = !0u64;
             }
             0
         }
         SYS_EXECVE => {
-            // execve(path, path_len) - minimal: load file bytes from in-RAM FS and parse ELF
-            if CURRENT_NODE_IDX == 0xFF {
-                *(frame_ptr as *mut u64) = !0u64;
-                return 0;
-            }
-            let path_ptr = *frame.add(5) as *const u8;
-            let path_len = *frame.add(4) as usize;
+            // execve(path, path_len)
+            log!("execve: start\r\n");
+            let path_ptr = tf.rdi as *const u8;
+            let path_len = tf.rsi as usize;
             if !validate_buf(path_ptr, path_len.min(64)) {
-                *(frame_ptr as *mut u64) = !0u64;
+                log!("execve: failed validate_buf\r\n");
+                tf.rax = !0u64;
                 return 0;
             }
             let mut path_buf = [0u8; 64];
@@ -721,64 +965,158 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
                 path_buf[i] = unsafe { *path_ptr.add(i) };
             }
             let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
-            let bytes = fs::read_file(path).unwrap_or_default();
-            if bytes.is_empty() {
-                *(frame_ptr as *mut u64) = !0u64;
-                return 0;
-            }
-            let cr3 = graph().nodes[CURRENT_NODE_IDX].cr3;
-            match elf::load_elf(&bytes, cr3, unsafe { HHDM_OFFSET }) {
-                Ok(info) => {
-                    // Set entry point by rewriting saved frame RIP slot
-                    graph().nodes[CURRENT_NODE_IDX].saved_rip = info.entry;
-                    *(frame_ptr as *mut u64) = 0;
+            log!("execve: reading file '{}'\r\n", path);
+            let bytes = match fs::read_file(path) {
+                Some(b) => b,
+                None => {
+                    log!("execve: failed read_file\r\n");
+                    tf.rax = !0u64;
+                    return 0;
                 }
+            };
+
+            // 1. Create fresh AddressSpace + CR3
+            let new_cr3 = match paging::create_process_page_table(HHDM_OFFSET) {
+                Some(c) => c,
+                None => {
+                    log!("execve: failed create_process_page_table\r\n");
+                    tf.rax = !0u64;
+                    return 0;
+                }
+            };
+            log!("execve: created new CR3 = {:#x}\r\n", new_cr3);
+            let mut new_aspace = memory::address_space::AddressSpace::new(new_cr3);
+
+            // 2. Load ELF (installs VMAs + maps file-backed pages)
+            let info = match elf::load_elf(&mut new_aspace, &bytes) {
+                Ok(i) => i,
                 Err(_) => {
-                    *(frame_ptr as *mut u64) = !0u64;
+                    log!("execve: failed load_elf\r\n");
+                    tf.rax = !0u64;
+                    return 0;
+                }
+            };
+            log!(
+                "execve: loaded ELF entry = {:#x} vmas={}\r\n",
+                info.entry,
+                new_aspace.vmas.len()
+            );
+
+            // 3. Install user stack VMA (8 MiB, growing down)
+            let stack_size: u64 = 8 * 1024 * 1024;
+            let stack_start = memory::layout::USER_STACK_TOP - stack_size;
+            let stack_vma = Vma::new(stack_start, stack_size, true, false);
+            new_aspace.vmas.push(stack_vma);
+            log!(
+                "execve: installed stack VMA at {:#x} (size {:#x})\r\n",
+                stack_start,
+                stack_size
+            );
+
+            // 4. Eagerly map + zero the top stack page (optional but recommended)
+            let hhdm = paging::hhdm_offset();
+            let stack_top_page0 = memory::layout::USER_STACK_TOP - 4096;
+            let stack_top_page1 = memory::layout::USER_STACK_TOP - 8192;
+            for &va in &[stack_top_page1, stack_top_page0] {
+                if let Some(phys) = paging::alloc_frame_phys() {
+                    unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096) };
+                    let _ = paging::map_page_ex(new_aspace.cr3, hhdm, va, phys, true, true, false);
+                    log!("execve: mapped stack page va={:#x} phys={:#x}\r\n", va, phys);
+                } else {
+                    log!("execve: warning: could not alloc stack page va={:#x}\r\n", va);
                 }
             }
+
+            // 5. Replace current process image
+            let proc = match scheduler::current_process_mut() {
+                Some(p) => p,
+                None => {
+                    log!("execve: failed current_process_mut\r\n");
+                    tf.rax = !0u64;
+                    return 0;
+                }
+            };
+            let _old_cr3 = proc.aspace.cr3; // optional: reclaim later once we track user frames
+            proc.aspace = new_aspace;
+            log!(
+                "execve: switching CR3 old={:#x} new={:#x}\r\n",
+                _old_cr3,
+                proc.aspace.cr3
+            );
+            unsafe { paging::switch_cr3(proc.aspace.cr3) };
+            log!("execve: after switch_cr3\r\n");
+
+            // 6. Reset context / TrapFrame for new binary
+            proc.context = process::ProcessContext::zero();
+            proc.context.rip = info.entry;
+            proc.context.rflags = 0x202;
+
+            // Our TrapFrame ABI only contains GPRs; the iret frame lives immediately after it
+            // on the saved kernel stack: [15 regs][RIP, CS, RFLAGS, RSP, SS].
+            let user_rsp = memory::layout::USER_STACK_TOP - 0x100;
+            log!(
+                "execve: patching iret frame rip={:#x} rsp={:#x}\r\n",
+                info.entry,
+                user_rsp
+            );
+            unsafe {
+                // Clear live GPRs so the new image starts clean.
+                core::ptr::write_bytes(tf as *mut TrapFrame as *mut u8, 0, core::mem::size_of::<TrapFrame>());
+                // Safety net: explicitly clear common argument/scratch regs.
+                tf.rax = 0;
+                tf.rbx = 0;
+                tf.rcx = 0;
+                tf.rdx = 0;
+                tf.rdi = 0;
+                tf.rsi = 0;
+                // Patch the iret frame that `iretq` will use when we return from the syscall.
+                let iret = (tf as *mut TrapFrame as *mut u64).add(15);
+                iret.add(0).write(info.entry); // RIP
+                // CS at +1 left as-is (user selector already set up for user processes)
+                iret.add(2).write(0x202u64); // RFLAGS
+                iret.add(3).write(user_rsp); // RSP (user)
+                // SS at +4 left as-is
+            }
+            proc.saved_rip = info.entry;
+            tf.rax = 0;
+            log!("execve: success\r\n");
             0
         }
         SYS_FORK => {
             // Minimal stub: not implemented yet (full address space clone later)
-            *(frame_ptr as *mut u64) = !0u64;
+            tf.rax = !0u64;
             0
         }
         SYS_EXIT => {
-            let status = *frame.add(5) as u8;
-            if CURRENT_NODE_IDX != 0xFF {
-                let idx = CURRENT_NODE_IDX;
-                graph().nodes[idx].state = NodeState::Exited;
-                graph().nodes[idx].exit_status = status;
-                graph().nodes[idx].saved_rsp = frame_ptr as u64;
-                let parent = graph().nodes[idx].parent;
+            let status = tf.rdi as u8;
+            if let Some(idx) = scheduler::current_idx() {
+                graph().procs[idx].state = NodeState::Exited;
+                graph().procs[idx].exit_status = status;
+                graph().procs[idx].saved_rsp = tf as *mut TrapFrame as u64;
+                let parent = graph().procs[idx].parent;
                 if parent != PARENT_NONE && parent < graph().count() {
-                    if matches!(graph().nodes[parent].state, NodeState::Waiting) {
-                        graph().nodes[parent].state = NodeState::Ready;
-                        let parent_rsp = graph().nodes[parent].saved_rsp;
+                    if matches!(graph().procs[parent].state, NodeState::Waiting) {
+                        graph().procs[parent].state = NodeState::Ready;
+                        let parent_rsp = graph().procs[parent].saved_rsp;
                         if parent_rsp != 0 {
                             unsafe {
-                                *(parent_rsp as *mut u64) = (graph().nodes[idx].id as u64) << 8 | status as u64;
+                                *(parent_rsp as *mut u64) = (graph().procs[idx].id as u64) << 8 | status as u64;
                             }
                         }
                     }
                 }
             }
-            let cur = if CURRENT_NODE_IDX != 0xFF {
-                Some(CURRENT_NODE_IDX)
-            } else {
-                None
-            };
-            CURRENT_NODE_IDX = 0xFF;
+            let cur = scheduler::current_idx();
+            scheduler::set_current_idx(None);
             do_schedule(cur)
         }
         SYS_LS => {
-            let path_ptr = *frame.add(5) as *const u8;
-            let path_len = *frame.add(4) as usize;
-            let out_ptr = *frame.add(3) as *mut u8;
-            let out_len = *frame.add(2) as usize;
+            let path_ptr = tf.rdi as *const u8;
+            let path_len = tf.rsi as usize;
+            let out_ptr = tf.rdx as *mut u8;
+            let out_len = tf.rcx as usize;
             if !validate_buf(path_ptr, path_len.min(64)) || !validate_buf(out_ptr, out_len) {
-                *(frame_ptr as *mut u64) = !0u64;
+                tf.rax = !0u64;
                 return 0;
             }
             let mut path_buf = [0u8; 64];
@@ -798,16 +1136,16 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
                     }
                 }
             }
-            *(frame_ptr as *mut u64) = n as u64;
+            tf.rax = n as u64;
             0
         }
         SYS_CAT => {
-            let path_ptr = *frame.add(5) as *const u8;
-            let path_len = *frame.add(4) as usize;
-            let out_ptr = *frame.add(3) as *mut u8;
-            let out_len = *frame.add(2) as usize;
+            let path_ptr = tf.rdi as *const u8;
+            let path_len = tf.rsi as usize;
+            let out_ptr = tf.rdx as *mut u8;
+            let out_len = tf.rcx as usize;
             if !validate_buf(path_ptr, path_len.min(64)) || !validate_buf(out_ptr, out_len) {
-                *(frame_ptr as *mut u64) = !0u64;
+                tf.rax = !0u64;
                 return 0;
             }
             let mut path_buf = [0u8; 64];
@@ -824,26 +1162,32 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
                     n += 1;
                 }
             }
-            *(frame_ptr as *mut u64) = n as u64;
+            tf.rax = n as u64;
             0
         }
         SYS_PS => {
-            let out_ptr = *frame.add(5) as *mut u8;
-            let out_len = *frame.add(4) as usize;
+            let out_ptr = tf.rdi as *mut u8;
+            let out_len = tf.rsi as usize;
             if !validate_buf(out_ptr, out_len) {
-                *(frame_ptr as *mut u64) = !0u64;
+                tf.rax = !0u64;
                 return 0;
             }
             let mut s = alloc::format!("pid  act  ten  state\r\n");
             for i in 0..graph().count() {
-                let n = &graph().nodes[i];
+                let n = &graph().procs[i];
                 let st = match n.state {
                     NodeState::Ready => "R",
                     NodeState::Running => "X",
                     NodeState::Exited => "E",
                     NodeState::Waiting => "W",
                 };
-                s += &alloc::format!("{}  {}  {}  {}\r\n", n.id, n.activation, n.tension, st);
+                s += &alloc::format!(
+                    "{}  {}  {}  {}\r\n",
+                    n.id,
+                    n.node.activation,
+                    n.node.tension,
+                    st
+                );
             }
             let mut n = 0usize;
             for b in s.bytes() {
@@ -852,14 +1196,14 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
                     n += 1;
                 }
             }
-            *(frame_ptr as *mut u64) = n as u64;
+            tf.rax = n as u64;
             0
         }
         SYS_TOUCH => {
-            let path_ptr = *frame.add(5) as *const u8;
-            let path_len = *frame.add(4) as usize;
+            let path_ptr = tf.rdi as *const u8;
+            let path_len = tf.rsi as usize;
             if !validate_buf(path_ptr, path_len.min(64)) {
-                *(frame_ptr as *mut u64) = !0u64;
+                tf.rax = !0u64;
                 return 0;
             }
             let mut path_buf = [0u8; 64];
@@ -868,14 +1212,14 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
                 path_buf[i] = unsafe { *path_ptr.add(i) };
             }
             let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
-            *(frame_ptr as *mut u64) = fs::touch(path) as u64;
+            tf.rax = fs::touch(path) as u64;
             0
         }
         SYS_MKDIR => {
-            let path_ptr = *frame.add(5) as *const u8;
-            let path_len = *frame.add(4) as usize;
+            let path_ptr = tf.rdi as *const u8;
+            let path_len = tf.rsi as usize;
             if !validate_buf(path_ptr, path_len.min(64)) {
-                *(frame_ptr as *mut u64) = !0u64;
+                tf.rax = !0u64;
                 return 0;
             }
             let mut path_buf = [0u8; 64];
@@ -884,16 +1228,16 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
                 path_buf[i] = unsafe { *path_ptr.add(i) };
             }
             let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
-            *(frame_ptr as *mut u64) = fs::mkdir(path) as u64;
+            tf.rax = fs::mkdir(path) as u64;
             0
         }
         SYS_WRITE_F => {
-            let path_ptr = *frame.add(5) as *const u8;
-            let path_len = *frame.add(4) as usize;
-            let data_ptr = *frame.add(3) as *const u8;
-            let data_len = *frame.add(2) as usize;
+            let path_ptr = tf.rdi as *const u8;
+            let path_len = tf.rsi as usize;
+            let data_ptr = tf.rdx as *const u8;
+            let data_len = tf.rcx as usize;
             if !validate_buf(path_ptr, path_len.min(64)) || !validate_buf(data_ptr, data_len.min(256)) {
-                *(frame_ptr as *mut u64) = !0u64;
+                tf.rax = !0u64;
                 return 0;
             }
             let mut path_buf = [0u8; 64];
@@ -903,7 +1247,7 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             }
             let path = core::str::from_utf8(&path_buf[..plen]).unwrap_or("");
             let data = core::slice::from_raw_parts(data_ptr, data_len.min(256));
-            *(frame_ptr as *mut u64) = fs::write_file(path, data) as u64;
+            tf.rax = fs::write_file(path, data) as u64;
             0
         }
         SYS_SHUTDOWN => {
@@ -925,10 +1269,10 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             }
         }
         SYS_RM => {
-            let path_ptr = *frame.add(5) as *const u8;
-            let path_len = *frame.add(4) as usize;
+            let path_ptr = tf.rdi as *const u8;
+            let path_len = tf.rsi as usize;
             if !validate_buf(path_ptr, path_len.min(64)) {
-                *(frame_ptr as *mut u64) = !0u64;
+                tf.rax = !0u64;
                 return 0;
             }
             let mut path_buf = [0u8; 64];
@@ -937,26 +1281,27 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
                 path_buf[i] = unsafe { *path_ptr.add(i) };
             }
             let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
-            *(frame_ptr as *mut u64) = fs::rm(path) as u64;
+            tf.rax = fs::rm(path) as u64;
             0
         }
         SYS_GETPID => {
-            *(frame_ptr as *mut u64) = if CURRENT_NODE_IDX != 0xFF {
-                graph().nodes[CURRENT_NODE_IDX].id as u64
-            } else {
-                !0u64
-            };
+            tf.rax = scheduler::current_idx()
+                .map(|i| graph().procs[i].id as u64)
+                .unwrap_or(!0u64);
             0
         }
         SYS_CHDIR => {
-            if CURRENT_NODE_IDX == 0xFF {
-                *(frame_ptr as *mut u64) = !0u64;
-                return 0;
-            }
-            let path_ptr = *frame.add(5) as *const u8;
-            let path_len = *frame.add(4) as usize;
+            let cur_idx = match scheduler::current_idx() {
+                Some(i) => i,
+                None => {
+                    tf.rax = !0u64;
+                    return 0;
+                }
+            };
+            let path_ptr = tf.rdi as *const u8;
+            let path_len = tf.rsi as usize;
             if !validate_buf(path_ptr, path_len.min(CWD_MAX)) {
-                *(frame_ptr as *mut u64) = !0u64;
+                tf.rax = !0u64;
                 return 0;
             }
             let mut path_buf = [0u8; CWD_MAX];
@@ -967,30 +1312,33 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             path_buf[len] = 0;
             let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("/");
             if path == "/" || fs::path_is_dir(path) {
-                let node = &mut graph().nodes[CURRENT_NODE_IDX];
+                let node = &mut graph().procs[cur_idx];
                 let copy = path.len().min(CWD_MAX - 1);
                 for i in 0..copy {
                     node.cwd[i] = path.as_bytes()[i];
                 }
                 node.cwd[copy] = 0;
-                *(frame_ptr as *mut u64) = 1;
+                tf.rax = 1;
             } else {
-                *(frame_ptr as *mut u64) = 0;
+                tf.rax = 0;
             }
             0
         }
         SYS_GETCWD => {
-            if CURRENT_NODE_IDX == 0xFF {
-                *(frame_ptr as *mut u64) = !0u64;
-                return 0;
-            }
-            let out_ptr = *frame.add(5) as *mut u8;
-            let out_len = *frame.add(4) as usize;
+            let cur_idx = match scheduler::current_idx() {
+                Some(i) => i,
+                None => {
+                    tf.rax = !0u64;
+                    return 0;
+                }
+            };
+            let out_ptr = tf.rdi as *mut u8;
+            let out_len = tf.rsi as usize;
             if !validate_buf(out_ptr, out_len) {
-                *(frame_ptr as *mut u64) = !0u64;
+                tf.rax = !0u64;
                 return 0;
             }
-            let node = &graph().nodes[CURRENT_NODE_IDX];
+            let node = &graph().procs[cur_idx];
             let mut len = 0;
             while len < CWD_MAX && node.cwd[len] != 0 {
                 len += 1;
@@ -1002,48 +1350,50 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
             if copy < out_len {
                 unsafe { *out_ptr.add(copy) = 0 };
             }
-            *(frame_ptr as *mut u64) = copy as u64;
+            tf.rax = copy as u64;
             0
         }
         SYS_WAIT => {
-            if CURRENT_NODE_IDX == 0xFF {
-                *(frame_ptr as *mut u64) = !0u64;
-                return 0;
-            }
-            let cur_idx = CURRENT_NODE_IDX;
+            let cur_idx = match scheduler::current_idx() {
+                Some(i) => i,
+                None => {
+                    tf.rax = !0u64;
+                    return 0;
+                }
+            };
             let mut exited_child = None;
             for i in 0..graph().count() {
-                if graph().nodes[i].parent == cur_idx && matches!(graph().nodes[i].state, NodeState::Exited) {
+                if graph().procs[i].parent == cur_idx && matches!(graph().procs[i].state, NodeState::Exited) {
                     exited_child = Some(i);
                     break;
                 }
             }
             if let Some(idx) = exited_child {
-                let status = graph().nodes[idx].exit_status;
-                let pid = graph().nodes[idx].id;
-                graph().nodes[idx].parent = PARENT_NONE;
-                *(frame_ptr as *mut u64) = (pid as u64) << 8 | status as u64;
+                let status = graph().procs[idx].exit_status;
+                let pid = graph().procs[idx].id;
+                graph().procs[idx].parent = PARENT_NONE;
+                tf.rax = (pid as u64) << 8 | status as u64;
                 0
             } else {
-                graph().nodes[cur_idx].state = NodeState::Waiting;
-                graph().nodes[cur_idx].saved_rsp = frame_ptr as u64;
+                graph().procs[cur_idx].state = NodeState::Waiting;
+                graph().procs[cur_idx].saved_rsp = tf as *mut TrapFrame as u64;
                 let cur = Some(cur_idx);
                 do_schedule(cur)
             }
         }
         SYS_KILL => {
-            let pid = *frame.add(5) as u32;
-            let sig = *frame.add(4) as u32;
+            let pid = tf.rdi as u32;
+            let sig = tf.rsi as u32;
             if sig == 9 {
                 for i in 0..graph().count() {
-                    if graph().nodes[i].id == pid {
-                        graph().nodes[i].state = NodeState::Exited;
-                        graph().nodes[i].exit_status = 128 + 9;
-                        let parent = graph().nodes[i].parent;
+                    if graph().procs[i].id == pid {
+                        graph().procs[i].state = NodeState::Exited;
+                        graph().procs[i].exit_status = 128 + 9;
+                        let parent = graph().procs[i].parent;
                         if parent != PARENT_NONE && parent < graph().count() {
-                            if matches!(graph().nodes[parent].state, NodeState::Waiting) {
-                                graph().nodes[parent].state = NodeState::Ready;
-                                let parent_rsp = graph().nodes[parent].saved_rsp;
+                            if matches!(graph().procs[parent].state, NodeState::Waiting) {
+                                graph().procs[parent].state = NodeState::Ready;
+                                let parent_rsp = graph().procs[parent].saved_rsp;
                                 if parent_rsp != 0 {
                                     unsafe {
                                         *(parent_rsp as *mut u64) = (pid as u64) << 8 | 137;
@@ -1051,12 +1401,12 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
                                 }
                             }
                         }
-                        *(frame_ptr as *mut u64) = 0;
+                        tf.rax = 0;
                         return 0;
                     }
                 }
             }
-            *(frame_ptr as *mut u64) = !0u64;
+            tf.rax = !0u64;
             0
         }
         _ => !0u64,
@@ -1066,12 +1416,12 @@ pub unsafe extern "C" fn syscall_handler(frame_ptr: *mut u8) -> u64 {
 #[inline(never)]
 unsafe extern "C" fn node_entry() {
     loop {
-        let idx = CURRENT_NODE_IDX;
-        if idx == 0xFF {
-            break;
-        }
-        let node_id = graph().nodes[idx].id;
-        let act = graph().nodes[idx].activation;
+        let idx = match scheduler::current_idx() {
+            Some(i) => i,
+            None => break,
+        };
+        let node_id = graph().procs[idx].id;
+        let act = graph().procs[idx].node.activation;
         match node_id {
             0 => {
                 do_sys_write(b"Node 0 stats: act=");
@@ -1093,23 +1443,24 @@ unsafe extern "C" fn node_entry() {
 
 fn init_node_stacks(g: &mut ProcessGraph) {
     for i in 0..g.count() {
-        let entry = if g.nodes[i].id == 0 {
+        let entry = if g.procs[i].id == 0 {
             shell::shell_main as *const () as u64
         } else {
             node_entry as *const () as u64
         };
-        init_node_stacks_for_with_entry(&mut g.nodes[i], entry);
+        init_node_stacks_for_with_entry(&mut g.procs[i], entry);
     }
 }
 
-fn init_node_stacks_for(node: &mut ProcessNode) {
+fn init_node_stacks_for(node: &mut Process) {
     let entry = node_entry as *const () as u64;
     init_node_stacks_for_with_entry(node, entry);
 }
 
-const INIT_FRAME_SIZE: usize = 168;
+// TrapFrame (15 regs) + iret frame (5 qwords)
+const INIT_FRAME_SIZE: usize = (15 + 5) * 8;
 
-fn init_node_stacks_for_with_entry(node: &mut ProcessNode, entry: u64) {
+fn init_node_stacks_for_with_entry(node: &mut Process, entry: u64) {
     let (code_sel, data_sel) = if node.id == 0 {
         (0x08u64, 0x10u64)
     } else {
@@ -1117,21 +1468,42 @@ fn init_node_stacks_for_with_entry(node: &mut ProcessNode, entry: u64) {
     };
     let rflags = 0x202u64;
     unsafe {
-        node.cr3 = if HHDM_OFFSET != 0 {
+        node.aspace.cr3 = if HHDM_OFFSET != 0 {
             paging::create_process_page_table(HHDM_OFFSET).unwrap_or(KERNEL_CR3)
         } else {
             KERNEL_CR3
         };
-        let base = node.stack.as_mut_ptr().add(STACK_SIZE - INIT_FRAME_SIZE) as *mut u64;
-        let stack_rsp = base as u64;
-        for j in 0..16 {
-            base.add(j).write(0);
+        let (kbase, ktop) = map_process_kernel_stack(node.id as usize).unwrap_or((0, 0));
+        node.kernel_stack_base = kbase;
+        node.kernel_stack_top = ktop;
+
+        let frame_base = (ktop - (INIT_FRAME_SIZE as u64)) as *mut u64;
+        let stack_rsp = frame_base as u64;
+        // Zero the TrapFrame register save area (15 qwords).
+        for j in 0..15 {
+            frame_base.add(j).write(0);
         }
-        base.add(16).write(entry);
-        base.add(17).write(code_sel);
-        base.add(18).write(rflags);
-        base.add(19).write(stack_rsp);
-        base.add(20).write(data_sel);
+        // iretq frame immediately after TrapFrame
+        frame_base.add(15).write(entry); // RIP
+        frame_base.add(16).write(code_sel); // CS
+        frame_base.add(17).write(rflags); // RFLAGS
+        frame_base.add(18).write(stack_rsp); // RSP
+        frame_base.add(19).write(data_sel); // SS
+
+        // Initial resumable frame pointer points at TrapFrame (r15..rax).
+        node.saved_rsp = stack_rsp;
+
+        // Seed the canonical typed context from the initial TrapFrame + iret frame so a
+        // never-before-run process has a valid `context`.
+        let tf = &*(stack_rsp as *const TrapFrame);
+        let mut ctx = process::ProcessContext::from_trap_frame(tf);
+        // Save initial resume pointer + iret frame values.
+        ctx.rsp = stack_rsp;
+        ctx.rip = *frame_base.add(15);
+        ctx.cs = *frame_base.add(16);
+        ctx.rflags = *frame_base.add(17);
+        ctx.ss = *frame_base.add(19);
+        node.context = ctx;
     }
 }
 
@@ -1177,10 +1549,7 @@ fn safe_limine_fb_clear(addr: u64, pitch: u64, height: u64) -> bool {
 /// Full boot sequence: Limine, GDT/IDT/TSS, VGA, fs, persist, graph, shell.
 fn full_boot() -> ! {
     serial_init();
-    serial_write("K1 - Kernel entry\r\n");
-
-    // Init kernel heap (must be before any allocation)
-    allocator::init();
+    log!("K1 - Kernel entry\r\n");
 
     // Limine: check revision
     if !BASE_REVISION.is_supported() {
@@ -1194,7 +1563,15 @@ fn full_boot() -> ! {
         HHDM_OFFSET = hhdm.offset();
     }
     unsafe {
+        paging::set_hhdm_offset(HHDM_OFFSET);
+    }
+    unsafe {
         asm!("mov {}, cr3", out(reg) KERNEL_CR3, options(nostack, preserves_flags));
+    }
+    // Enable NX so we can map kernel heap pages as non-executable.
+    unsafe {
+        let flags = Efer::read() | EferFlags::NO_EXECUTE_ENABLE;
+        Efer::write(flags);
     }
 
     // VGA: framebuffer or text mode
@@ -1228,7 +1605,7 @@ fn full_boot() -> ! {
     let df_stack_top = VirtAddr::new(unsafe { &DOUBLE_FAULT_STACK as *const _ as u64 } + 4096);
     tss.interrupt_stack_table[1] = df_stack_top;
     // IST[0] used as per-process kernel stack for interrupts from user mode.
-    let ist0_top = VirtAddr::new(unsafe { &KERNEL_IST_STACKS[0] as *const _ as u64 } + 4096);
+    let ist0_top = VirtAddr::new(unsafe { &IST0_BOOT_STACK as *const _ as u64 } + 4096);
     tss.interrupt_stack_table[0] = ist0_top;
 
     unsafe {
@@ -1243,8 +1620,8 @@ fn full_boot() -> ! {
     let tss_sel = gdt.add_entry(Descriptor::tss_segment(unsafe { &*TSS.as_ptr() }));
 
     unsafe {
-        let gdt_leak = Box::leak(Box::new(gdt));
-        gdt_leak.load();
+        GDT_STORE.write(gdt);
+        (&*GDT_STORE.as_ptr()).load();
         SS::set_reg(SegmentSelector::new(2, PrivilegeLevel::Ring0));
         CS::set_reg(SegmentSelector::new(1, PrivilegeLevel::Ring0));
         load_tss(tss_sel);
@@ -1258,16 +1635,31 @@ fn full_boot() -> ! {
             .set_handler_addr(VirtAddr::new(df_handler))
             .set_stack_index(1);
     }
-    idt[IRQ_TIMER as usize]
-        .set_handler_fn(timer_handler_x86);
+    // Use assembly stub so we can save/restore full TrapFrame regs.
+    unsafe {
+        idt[IRQ_TIMER as usize]
+            .set_handler_addr(VirtAddr::new(timer_stub as *const () as u64));
+    }
     unsafe {
         idt[SYSCALL_VECTOR as usize]
             .set_handler_addr(VirtAddr::new(syscall_stub as *const () as u64))
             .set_privilege_level(PrivilegeLevel::Ring3);
     }
     idt.page_fault.set_handler_fn(page_fault_handler);
-    let idt_leak = Box::leak(Box::new(idt));
-    idt_leak.load();
+    unsafe {
+        IDT_STORE.write(idt);
+        (&*IDT_STORE.as_ptr()).load();
+    }
+
+    // Initialize kernel heap AFTER IDT has page fault handler installed.
+    memory::init_kernel_heap();
+    log!(
+        "heap: base={:#x} init_size={:#x} mapped_pages={} mapped_bytes={:#x}\r\n",
+        memory::layout::KERNEL_HEAP_BASE,
+        memory::layout::KERNEL_HEAP_INITIAL_SIZE,
+        HEAP_PAGES_MAPPED.load(Ordering::Relaxed),
+        HEAP_PAGES_MAPPED.load(Ordering::Relaxed) * 4096
+    );
 
     // PIC, PIT, keyboard
     unsafe {
@@ -1292,32 +1684,57 @@ fn full_boot() -> ! {
 
     // Process graph
     unsafe {
-        GRAPH = Some(ProcessGraph::new());
+        scheduler::init_global_graph(ProcessGraph::new());
     }
     if graph().count() == 0 {
         graph().add_node(0, 100, 0, &[], PARENT_NONE);
     }
+    // Boot status banner (serial): processes + strongest + CR3.
+    let proc_count = graph().count();
+    let strongest = graph().select_strongest();
+    log!("boot: processes={}\r\n", proc_count);
+    if let Some(si) = strongest {
+        let p = &graph().procs[si];
+        log!(
+            "boot: strongest idx={} pid={} act={} tens={} cr3={:#x}\r\n",
+            si,
+            p.id,
+            p.node.activation,
+            p.node.tension,
+            p.aspace.cr3
+        );
+    } else {
+        log!("boot: strongest=<none>\r\n");
+    }
 
     // Default VMAs for newly spawned user nodes (Phase 1 baseline):
-    // - code/data: 0x0040_0000..0x0080_0000
-    // - stack: (stack_top-8MiB)..stack_top, with guard at stack_top-8MiB..stack_top-8MiB+4KiB left unmapped
-    // Node 0 is kernel-mode shell; VMAs are not used.
-    for n in graph().nodes.iter_mut() {
+    // keep legacy fixed array for now (scheduler still uses it), and keep AddressSpace (owned by process) in sync.
+    for n in graph().procs.iter_mut() {
         if n.id == 0 {
             continue;
         }
-        n.vma_count = 0;
-        let code = Vma { start: 0x0000_0000_0040_0000, end: 0x0000_0000_0080_0000, writable: true, executable: true };
         let stack_top = 0x0000_7FFF_FFFF_F000u64;
-        let stack = Vma { start: stack_top - (8 * 1024 * 1024), end: stack_top, writable: true, executable: false };
-        n.vmas[0] = code;
-        n.vmas[1] = stack;
-        n.vma_count = 2;
+        n.aspace.vmas.clear();
+        n.aspace.vmas.push(Vma::new(
+            0x0000_0000_0040_0000,
+            0x0000_0000_0080_0000 - 0x0000_0000_0040_0000,
+            true,
+            true,
+        ));
+        n.aspace.vmas.push(Vma::new(
+            stack_top - (8 * 1024 * 1024),
+            8 * 1024 * 1024,
+            true,
+            false,
+        ));
     }
     init_node_stacks(graph());
 
-    // Save kernel RSP and switch to shell
-    let shell_rsp = (graph().nodes[0].stack.as_ptr() as u64) + (STACK_SIZE - INIT_FRAME_SIZE) as u64;
+    // Save kernel RSP and switch to shell.
+    // bootstrap_switch expects RSP to point at the iret frame (RIP..SS),
+    // which lives immediately after the 15-qword TrapFrame register area.
+    let shell_base = graph().procs[0].saved_rsp;
+    let shell_rsp = shell_base + (15 * 8) as u64;
     unsafe {
         asm!(
             "mov {}, rsp",
@@ -1335,11 +1752,23 @@ pub extern "C" fn kmain() -> ! {
 
 #[panic_handler]
 fn rust_panic(_info: &core::panic::PanicInfo) -> ! {
+    log!("PANIC\r\n");
     console_write("PANIC\r\n");
     hcf();
 }
 
 pub(crate) fn hcf() -> ! {
+    if let Some(p) = scheduler::current_process_mut() {
+        log!(
+            "HCF: pid={} cr3={:#x} act={} tens={}\r\n",
+            p.id,
+            p.aspace.cr3,
+            p.node.activation,
+            p.node.tension
+        );
+    } else {
+        log!("HCF: no current process\r\n");
+    }
     loop {
         unsafe { asm!("hlt") };
     }

@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-03-18 – Phase 2: Cognitive Engine (P2.1–P2.6, in progress)
+
+### Summary
+Phase 2 refactor toward a self-improving microkernel guided by the Strongest Node Framework: canonical `Process`, typed trap/context state, preemptive switching, per-process kernel stacks, demand-friendly ELF loading, and an `execve` bringup path with strong serial tracing.
+
+### Highlights
+- **Canonical process model** – `process::Process` owns `Node`, `AddressSpace`, `ProcessContext`, and per-process kernel stack VA range.
+- **Typed trap/context** – `TrapFrame` + `ProcessContext` match stub push order; timer preemption saves/uses typed context.
+- **Per-process kernel stacks** – guard page + dynamic IST[0] on actual process switches.
+- **Demand-friendly ELF loader** – VMAs per PT_LOAD, maps only file-backed pages, respects `p_align`, rejects overlapping VMAs, and rolls back frames on partial failure.
+- **execve bringup** – fresh CR3/AddressSpace, ELF load, user stack VMA, top stack pages mapped, iret frame patched to new entry/RSP.
+- **Debug overhaul** – early `log!()` safe from interrupt context; `execve:` step trace, `PF:` classification, and `timer:` switch prints.
+- **Kernel heap demand paging fix** – heap faults map missing pages or halt loudly (no prune-on-OOM), preventing infinite PF loops / triple faults.
+
 ## 2025-03-17 – Phases 2–6: Full Roadmap Implementation
 
 ### Summary

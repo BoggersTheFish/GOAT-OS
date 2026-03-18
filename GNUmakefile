@@ -7,10 +7,11 @@ $(call USER_VARIABLE,KARCH,x86_64)
 # run-debug: serial stdio for host terminal debugging
 
 override IMAGE_NAME := ts-os-$(KARCH)
+ISO := $(IMAGE_NAME).iso
 DISK_IMG := disk.img
 
 .PHONY: all
-all: $(IMAGE_NAME).iso
+all: $(ISO)
 
 $(DISK_IMG):
 	@dd if=/dev/zero of=$(DISK_IMG) bs=1M count=16 2>/dev/null || \
@@ -23,19 +24,24 @@ test: $(IMAGE_NAME).iso $(DISK_IMG)
 	@./scripts/smoke_test.sh
 
 .PHONY: run
-run: $(IMAGE_NAME).iso $(DISK_IMG)
-	qemu-system-$(KARCH) -M q35 -cdrom $(IMAGE_NAME).iso -boot d \
-		-drive file=$(DISK_IMG),format=raw,if=ide -m 2G -display gtk
+run: $(ISO) $(DISK_IMG)
+	qemu-system-x86_64 -cdrom $(ISO) \
+	  -drive file=$(DISK_IMG),format=raw \
+	  -m 2G -smp 2
 
 .PHONY: run-debug
-run-debug: $(IMAGE_NAME).iso $(DISK_IMG)
-	qemu-system-$(KARCH) -M q35 -cdrom $(IMAGE_NAME).iso -boot d \
-		-drive file=$(DISK_IMG),format=raw,if=ide -m 2G -serial stdio -display gtk
+run-debug: $(ISO) $(DISK_IMG)
+	qemu-system-x86_64 -cdrom $(ISO) \
+	  -drive file=$(DISK_IMG),format=raw \
+	  -m 2G -smp 2 \
+	  -serial stdio \
+	  -d guest_errors,int,unimp \
+	  -no-reboot -no-shutdown
 
 .PHONY: run-debug-log
 run-debug-log: $(IMAGE_NAME).iso $(DISK_IMG)
 	qemu-system-$(KARCH) -M q35 -cdrom $(IMAGE_NAME).iso -boot d \
-		-drive file=$(DISK_IMG),format=raw,if=ide -m 2G -serial file:debug-60b9db.log -display gtk
+		-drive file=$(DISK_IMG),format=raw,if=ide -m 2G -serial file:debug-60b9db.log -d guest_errors,int -no-reboot -no-shutdown -display gtk
 
 .PHONY: run-uefi
 run-uefi: edk2-ovmf $(IMAGE_NAME).iso $(DISK_IMG)

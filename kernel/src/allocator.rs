@@ -3,24 +3,11 @@
 
 use linked_list_allocator::LockedHeap;
 
-const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
-
-#[repr(align(4096))]
-struct HeapBacking([u8; HEAP_SIZE]);
-
-static mut HEAP_BACKING: HeapBacking = HeapBacking([0; HEAP_SIZE]);
-static mut HEAP_INIT: bool = false;
-
 #[global_allocator]
-static HEAP: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-/// Initialize the kernel heap. Must be called once at boot before any allocation.
-pub fn init() {
-    unsafe {
-        if !HEAP_INIT {
-            let heap_start = HEAP_BACKING.0.as_mut_ptr();
-            HEAP.lock().init(heap_start, HEAP_SIZE);
-            HEAP_INIT = true;
-        }
-    }
+/// Initialize the kernel heap at a fixed virtual base.
+/// Pages backing this region are mapped on demand by the page fault handler.
+pub unsafe fn init_at(heap_base: usize, heap_initial_size: usize) {
+    ALLOCATOR.lock().init(heap_base as *mut u8, heap_initial_size);
 }
