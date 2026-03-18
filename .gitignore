@@ -7,6 +7,8 @@ iso_root/
 # Runtime artifacts
 disk.img
 debug-*.log
+qemu_*.log
+qemu_*.pid
 
 # External deps
 limine/
